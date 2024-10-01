@@ -1,10 +1,12 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use mysten_metrics::histogram::Histogram;
-use prometheus::{register_int_gauge_with_registry, IntGauge, Registry};
+use mysten_metrics::histogram::Histogram as MystenHistogram;
+use prometheus::{
+    register_histogram_with_registry, register_int_gauge_with_registry, Histogram, IntGauge,
+    Registry,
+};
 use std::sync::Arc;
-use std::time::Duration;
 use sui_types::messages_checkpoint::CheckpointSequenceNumber;
 use tap::Pipe;
 
@@ -46,12 +48,14 @@ impl Metrics {
         }
     }
 
-    pub fn report_checkpoint_summary_age(&self, age: Duration) {
+    pub fn checkpoint_summary_age_metrics(&self) -> Option<(&Histogram, &MystenHistogram)> {
         if let Some(inner) = &self.0 {
-            inner
-                .checkpoint_summary_age_ms
-                .report(age.as_millis() as u64);
+            return Some((
+                &inner.checkpoint_summary_age,
+                &inner.checkpoint_summary_age_ms,
+            ));
         }
+        None
     }
 }
 
@@ -59,7 +63,9 @@ struct Inner {
     highest_known_checkpoint: IntGauge,
     highest_verified_checkpoint: IntGauge,
     highest_synced_checkpoint: IntGauge,
-    checkpoint_summary_age_ms: Histogram,
+    checkpoint_summary_age: Histogram,
+    // TODO: delete once users are migrated to non-Mysten histogram.
+    checkpoint_summary_age_ms: MystenHistogram,
 }
 
 impl Inner {
@@ -86,7 +92,14 @@ impl Inner {
             )
             .unwrap(),
 
-            checkpoint_summary_age_ms: Histogram::new_in_registry(
+            checkpoint_summary_age: register_histogram_with_registry!(
+                "checkpoint_summary_age",
+                "Age of checkpoints summaries when they arrive and are verified.",
+                mysten_metrics::LATENCY_SEC_BUCKETS.to_vec(),
+                registry,
+            )
+            .unwrap(),
+            checkpoint_summary_age_ms: MystenHistogram::new_in_registry(
                 "checkpoint_summary_age_ms",
                 "Age of checkpoints summaries when they arrive and are verified.",
                 registry,

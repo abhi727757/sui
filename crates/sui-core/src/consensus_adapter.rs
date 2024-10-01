@@ -6,22 +6,24 @@ use bytes::Bytes;
 use dashmap::try_result::TryResult;
 use dashmap::DashMap;
 use futures::future::{select, Either};
+use futures::stream::FuturesUnordered;
 use futures::FutureExt;
+use futures::{pin_mut, StreamExt};
 use itertools::Itertools;
-use mysten_network::Multiaddr;
 use narwhal_types::{TransactionProto, TransactionsClient};
-use narwhal_worker::LocalNarwhalClient;
-use parking_lot::{Mutex, RwLockReadGuard};
+use parking_lot::RwLockReadGuard;
+use prometheus::Histogram;
+use prometheus::HistogramVec;
+use prometheus::IntCounterVec;
 use prometheus::IntGauge;
+use prometheus::IntGaugeVec;
 use prometheus::Registry;
 use prometheus::{
-    linear_buckets, register_histogram_with_registry, register_int_counter_with_registry, Histogram,
+    register_histogram_vec_with_registry, register_histogram_with_registry,
+    register_int_counter_vec_with_registry, register_int_gauge_vec_with_registry,
+    register_int_gauge_with_registry,
 };
-use prometheus::{register_histogram_vec_with_registry, register_int_gauge_with_registry};
-use prometheus::{HistogramVec, IntCounter};
-use rand::rngs::StdRng;
-use rand::SeedableRng;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::future::Future;
 use std::ops::Deref;
 use std::sync::atomic::AtomicU64;
@@ -30,23 +32,26 @@ use std::sync::Arc;
 use std::time::Instant;
 use sui_types::base_types::TransactionDigest;
 use sui_types::committee::Committee;
-use sui_types::{
-    error::{SuiError, SuiResult},
-    messages::ConsensusTransaction,
-};
+use sui_types::error::{SuiError, SuiResult};
 
 use tap::prelude::*;
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::task::JoinHandle;
-use tokio::time::{self, sleep, timeout};
+use tokio::time::{self};
 
 use crate::authority::authority_per_epoch_store::AuthorityPerEpochStore;
+use crate::consensus_handler::{classify, SequencedConsensusTransactionKey};
+use crate::consensus_throughput_calculator::{ConsensusThroughputProfiler, Level};
 use crate::epoch::reconfiguration::{ReconfigState, ReconfigurationInitiator};
+use crate::metrics::LatencyObserver;
 use mysten_metrics::{spawn_monitored_task, GaugeGuard, GaugeGuardFutureExt};
+use sui_protocol_config::ProtocolConfig;
 use sui_simulator::anemo::PeerId;
 use sui_simulator::narwhal_network::connectivity::ConnectionStatus;
 use sui_types::base_types::AuthorityName;
-use sui_types::messages::ConsensusTransactionKind;
+use sui_types::fp_ensure;
+use sui_types::messages_consensus::ConsensusTransactionKind;
+use sui_types::messages_consensus::{ConsensusTransaction, ConsensusTransactionKey};
 use tokio::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -55,78 +60,100 @@ use tracing::{debug, info, warn};
 pub mod consensus_tests;
 
 const SEQUENCING_CERTIFICATE_LATENCY_SEC_BUCKETS: &[f64] = &[
-    0.1, 0.25, 0.5, 1., 2.5, 5., 7.5, 10., 12.5, 15., 20., 25., 30., 60., 90., 120., 180., 300.,
-    600.,
+    0.1, 0.25, 0.5, 0.75, 1., 1.25, 1.5, 1.75, 2., 2.25, 2.5, 2.75, 3., 4., 5., 6., 7., 10., 15.,
+    20., 25., 30., 60., 90., 120., 150., 180., 210., 240., 270., 300.,
+];
+
+const SEQUENCING_CERTIFICATE_POSITION_BUCKETS: &[f64] = &[
+    0., 1., 2., 3., 5., 10., 15., 20., 25., 30., 50., 100., 150., 200.,
 ];
 
 pub struct ConsensusAdapterMetrics {
     // Certificate sequencing metrics
-    pub sequencing_certificate_attempt: IntCounter,
-    pub sequencing_certificate_success: IntCounter,
-    pub sequencing_certificate_failures: IntCounter,
-    pub sequencing_certificate_inflight: IntGauge,
+    pub sequencing_certificate_attempt: IntCounterVec,
+    pub sequencing_certificate_success: IntCounterVec,
+    pub sequencing_certificate_failures: IntCounterVec,
+    pub sequencing_certificate_inflight: IntGaugeVec,
     pub sequencing_acknowledge_latency: HistogramVec,
     pub sequencing_certificate_latency: HistogramVec,
     pub sequencing_certificate_authority_position: Histogram,
+    pub sequencing_certificate_positions_moved: Histogram,
+    pub sequencing_certificate_preceding_disconnected: Histogram,
+    pub sequencing_certificate_processed: IntCounterVec,
     pub sequencing_in_flight_semaphore_wait: IntGauge,
     pub sequencing_in_flight_submissions: IntGauge,
     pub sequencing_estimated_latency: IntGauge,
+    pub sequencing_resubmission_interval_ms: IntGauge,
 }
 
 impl ConsensusAdapterMetrics {
     pub fn new(registry: &Registry) -> Self {
-        let authority_position_buckets = &[
-            linear_buckets(0.0, 1.0, 19).unwrap().as_slice(),
-            linear_buckets(20.0, 5.0, 10).unwrap().as_slice(),
-        ]
-        .concat();
-
         Self {
-            sequencing_certificate_attempt: register_int_counter_with_registry!(
+            sequencing_certificate_attempt: register_int_counter_vec_with_registry!(
                 "sequencing_certificate_attempt",
                 "Counts the number of certificates the validator attempts to sequence.",
+                &["tx_type"],
                 registry,
             )
                 .unwrap(),
-            sequencing_certificate_success: register_int_counter_with_registry!(
+            sequencing_certificate_success: register_int_counter_vec_with_registry!(
                 "sequencing_certificate_success",
                 "Counts the number of successfully sequenced certificates.",
+                &["tx_type"],
                 registry,
             )
                 .unwrap(),
-            sequencing_certificate_failures: register_int_counter_with_registry!(
+            sequencing_certificate_failures: register_int_counter_vec_with_registry!(
                 "sequencing_certificate_failures",
                 "Counts the number of sequenced certificates that failed other than by timeout.",
+                &["tx_type"],
                 registry,
             )
                 .unwrap(),
-            sequencing_certificate_inflight: register_int_gauge_with_registry!(
+            sequencing_certificate_inflight: register_int_gauge_vec_with_registry!(
                 "sequencing_certificate_inflight",
                 "The inflight requests to sequence certificates.",
+                &["tx_type"],
                 registry,
             )
                 .unwrap(),
             sequencing_acknowledge_latency: register_histogram_vec_with_registry!(
                 "sequencing_acknowledge_latency",
                 "The latency for acknowledgement from sequencing engine. The overall sequencing latency is measured by the sequencing_certificate_latency metric",
-                &["retry"],
+                &["retry", "tx_type"],
                 SEQUENCING_CERTIFICATE_LATENCY_SEC_BUCKETS.to_vec(),
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
             sequencing_certificate_latency: register_histogram_vec_with_registry!(
                 "sequencing_certificate_latency",
                 "The latency for sequencing a certificate.",
-                &["position", "mapped_to_low_scoring"],
+                &["position", "tx_type"],
                 SEQUENCING_CERTIFICATE_LATENCY_SEC_BUCKETS.to_vec(),
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
             sequencing_certificate_authority_position: register_histogram_with_registry!(
                 "sequencing_certificate_authority_position",
                 "The position of the authority when submitted a certificate to consensus.",
-                authority_position_buckets.to_vec(),
+                SEQUENCING_CERTIFICATE_POSITION_BUCKETS.to_vec(),
                 registry,
+            ).unwrap(),
+            sequencing_certificate_positions_moved: register_histogram_with_registry!(
+                "sequencing_certificate_positions_moved",
+                "The number of authorities ahead of ourselves that were filtered out when submitting a certificate to consensus.",
+                SEQUENCING_CERTIFICATE_POSITION_BUCKETS.to_vec(),
+                registry,
+            ).unwrap(),
+            sequencing_certificate_preceding_disconnected: register_histogram_with_registry!(
+                "sequencing_certificate_preceding_disconnected",
+                "The number of authorities that were hashed to an earlier position that were filtered out due to being disconnected when submitting to consensus.",
+                SEQUENCING_CERTIFICATE_POSITION_BUCKETS.to_vec(),
+                registry,
+            ).unwrap(),
+            sequencing_certificate_processed: register_int_counter_vec_with_registry!(
+                "sequencing_certificate_processed",
+                "The number of certificates that have been processed either by consensus or checkpoint.",
+                &["source"],
+                registry
             ).unwrap(),
             sequencing_in_flight_semaphore_wait: register_int_gauge_with_registry!(
                 "sequencing_in_flight_semaphore_wait",
@@ -136,13 +163,19 @@ impl ConsensusAdapterMetrics {
                 .unwrap(),
             sequencing_in_flight_submissions: register_int_gauge_with_registry!(
                 "sequencing_in_flight_submissions",
-                "Number of transactions submitted to local narwhal instance and not yet sequenced",
+                "Number of transactions submitted to local consensus instance and not yet sequenced",
                 registry,
             )
                 .unwrap(),
             sequencing_estimated_latency: register_int_gauge_with_registry!(
                 "sequencing_estimated_latency",
-                "Consensus latency estimated by consensus adapter",
+                "Consensus latency estimated by consensus adapter in milliseconds",
+                registry,
+            )
+                .unwrap(),
+            sequencing_resubmission_interval_ms: register_int_gauge_with_registry!(
+                "sequencing_resubmission_interval_ms",
+                "Resubmission interval used by consensus adapter in milliseconds",
                 registry,
             )
                 .unwrap(),
@@ -154,11 +187,12 @@ impl ConsensusAdapterMetrics {
     }
 }
 
+#[mockall::automock]
 #[async_trait::async_trait]
 pub trait SubmitToConsensus: Sync + Send + 'static {
     async fn submit_to_consensus(
         &self,
-        transaction: &ConsensusTransaction,
+        transactions: &[ConsensusTransaction],
         epoch_store: &Arc<AuthorityPerEpochStore>,
     ) -> SuiResult;
 }
@@ -167,89 +201,23 @@ pub trait SubmitToConsensus: Sync + Send + 'static {
 impl SubmitToConsensus for TransactionsClient<sui_network::tonic::transport::Channel> {
     async fn submit_to_consensus(
         &self,
-        transaction: &ConsensusTransaction,
+        transactions: &[ConsensusTransaction],
         _epoch_store: &Arc<AuthorityPerEpochStore>,
     ) -> SuiResult {
-        let serialized =
-            bcs::to_bytes(transaction).expect("Serializing consensus transaction cannot fail");
-        let bytes = Bytes::from(serialized.clone());
-
+        let transactions_bytes = transactions
+            .iter()
+            .map(|t| {
+                let serialized =
+                    bcs::to_bytes(t).expect("Serializing consensus transaction cannot fail");
+                Bytes::from(serialized)
+            })
+            .collect::<Vec<_>>();
         self.clone()
-            .submit_transaction(TransactionProto { transaction: bytes })
+            .submit_transaction(TransactionProto {
+                transactions: transactions_bytes,
+            })
             .await
             .map_err(|e| SuiError::ConsensusConnectionBroken(format!("{:?}", e)))
-            .tap_err(|r| {
-                // Will be logged by caller as well.
-                warn!("Submit transaction failed with: {:?}", r);
-            })?;
-        Ok(())
-    }
-}
-
-/// A Narwhal client that instantiates LocalNarwhalClient lazily.
-pub struct LazyNarwhalClient {
-    /// Outer ArcSwapOption allows initialization after the first connection to Narwhal.
-    /// Inner ArcSwap allows Narwhal restarts across epoch changes.
-    client: ArcSwapOption<ArcSwap<LocalNarwhalClient>>,
-    addr: Multiaddr,
-}
-
-impl LazyNarwhalClient {
-    /// Lazily instantiates LocalNarwhalClient keyed by the address of the Narwhal worker.
-    pub fn new(addr: Multiaddr) -> Self {
-        Self {
-            client: ArcSwapOption::empty(),
-            addr,
-        }
-    }
-
-    async fn get(&self) -> Arc<ArcSwap<LocalNarwhalClient>> {
-        // Narwhal may not have started and created LocalNarwhalClient, so retry in a loop.
-        // Retries should only happen on Sui process start.
-        if let Ok(client) = timeout(Duration::from_secs(30), async {
-            loop {
-                match LocalNarwhalClient::get_global(&self.addr) {
-                    Some(c) => return c,
-                    None => {
-                        sleep(Duration::from_millis(100)).await;
-                        continue;
-                    }
-                };
-            }
-        })
-        .await
-        {
-            return client;
-        }
-        panic!("Timed out waiting for Narwhal to start on {}!", self.addr);
-    }
-}
-
-#[async_trait::async_trait]
-impl SubmitToConsensus for LazyNarwhalClient {
-    async fn submit_to_consensus(
-        &self,
-        transaction: &ConsensusTransaction,
-        _epoch_store: &Arc<AuthorityPerEpochStore>,
-    ) -> SuiResult {
-        let transaction =
-            bcs::to_bytes(transaction).expect("Serializing consensus transaction cannot fail");
-        // The retrieved LocalNarwhalClient can be from the past epoch. Submit would fail after
-        // Narwhal shuts down, so there should be no correctness issue.
-        let client = {
-            let c = self.client.load();
-            if c.is_some() {
-                c
-            } else {
-                self.client.store(Some(self.get().await));
-                self.client.load()
-            }
-        };
-        let client = client.as_ref().unwrap().load();
-        client
-            .submit_transaction(transaction)
-            .await
-            .map_err(|e| SuiError::FailedToSubmitToConsensus(format!("{:?}", e)))
             .tap_err(|r| {
                 // Will be logged by caller as well.
                 warn!("Submit transaction failed with: {:?}", r);
@@ -261,22 +229,31 @@ impl SubmitToConsensus for LazyNarwhalClient {
 /// Submit Sui certificates to the consensus.
 pub struct ConsensusAdapter {
     /// The network client connecting to the consensus node of this authority.
-    consensus_client: Box<dyn SubmitToConsensus>,
+    consensus_client: Arc<dyn SubmitToConsensus>,
     /// Authority pubkey.
     authority: AuthorityName,
     /// The limit to number of inflight transactions at this node.
     max_pending_transactions: usize,
     /// Number of submitted transactions still inflight at this node.
     num_inflight_transactions: AtomicU64,
+    /// Dictates the maximum position  from which will submit to consensus. Even if the is elected to
+    /// submit from a higher position than this, it will "reset" to the max_submit_position.
+    max_submit_position: Option<usize>,
+    /// When provided it will override the current back off logic and will use this value instead
+    /// as delay step.
+    submit_delay_step_override: Option<Duration>,
     /// A structure to check the connection statuses populated by the Connection Monitor Listener
-    connection_monitor_status: Box<Arc<dyn CheckConnection>>,
+    connection_monitor_status: Arc<dyn CheckConnection>,
     /// A structure to check the reputation scores populated by Consensus
     low_scoring_authorities: ArcSwap<Arc<ArcSwap<HashMap<AuthorityName, u64>>>>,
+    /// The throughput profiler to be used when making decisions to submit to consensus
+    consensus_throughput_profiler: ArcSwapOption<ConsensusThroughputProfiler>,
     /// A structure to register metrics
     metrics: ConsensusAdapterMetrics,
-    /// Semaphore limiting parallel submissions to narwhal
+    /// Semaphore limiting parallel submissions to consensus
     submit_semaphore: Semaphore,
     latency_observer: LatencyObserver,
+    protocol_config: ProtocolConfig,
 }
 
 pub trait CheckConnection: Send + Sync {
@@ -300,12 +277,15 @@ pub struct ConnectionMonitorStatusForTests {}
 impl ConsensusAdapter {
     /// Make a new Consensus adapter instance.
     pub fn new(
-        consensus_client: Box<dyn SubmitToConsensus>,
+        consensus_client: Arc<dyn SubmitToConsensus>,
         authority: AuthorityName,
-        connection_monitor_status: Box<Arc<dyn CheckConnection>>,
+        connection_monitor_status: Arc<dyn CheckConnection>,
         max_pending_transactions: usize,
         max_pending_local_submissions: usize,
+        max_submit_position: Option<usize>,
+        submit_delay_step_override: Option<Duration>,
         metrics: ConsensusAdapterMetrics,
+        protocol_config: ProtocolConfig,
     ) -> Self {
         let num_inflight_transactions = Default::default();
         let low_scoring_authorities =
@@ -314,12 +294,16 @@ impl ConsensusAdapter {
             consensus_client,
             authority,
             max_pending_transactions,
+            max_submit_position,
+            submit_delay_step_override,
             num_inflight_transactions,
             connection_monitor_status,
             low_scoring_authorities,
             metrics,
             submit_semaphore: Semaphore::new(max_pending_local_submissions),
             latency_observer: LatencyObserver::new(),
+            consensus_throughput_profiler: ArcSwapOption::empty(),
+            protocol_config,
         }
     }
 
@@ -328,6 +312,10 @@ impl ConsensusAdapter {
         new_low_scoring: Arc<ArcSwap<HashMap<AuthorityName, u64>>>,
     ) {
         self.low_scoring_authorities.swap(Arc::new(new_low_scoring));
+    }
+
+    pub fn swap_throughput_profiler(&self, profiler: Arc<ConsensusThroughputProfiler>) {
+        self.consensus_throughput_profiler.store(Some(profiler))
     }
 
     // todo - this probably need to hold some kind of lock to make sure epoch does not change while we are recovering
@@ -357,46 +345,139 @@ impl ConsensusAdapter {
             }
         }
         debug!(
-            "Submitting {:?} recovered pending consensus transactions to Narwhal",
+            "Submitting {:?} recovered pending consensus transactions to consensus",
             recovered.len()
         );
         for transaction in recovered {
-            self.submit_unchecked(transaction, epoch_store);
+            if transaction.is_end_of_publish() {
+                info!(epoch=?epoch_store.epoch(), "Submitting EndOfPublish message to consensus");
+            }
+            self.submit_unchecked(&[transaction], epoch_store);
         }
     }
 
     fn await_submit_delay(
         &self,
         committee: &Committee,
-        transaction: &ConsensusTransaction,
-    ) -> (impl Future<Output = ()>, usize, bool) {
-        let (duration, position, mapped_to_low_scoring) = match &transaction.kind {
-            ConsensusTransactionKind::UserTransaction(certificate) => {
-                let tx_digest = certificate.digest();
-                let (position, mapped_to_low_scoring) =
-                    self.submission_position(committee, tx_digest);
-                const DEFAULT_LATENCY: Duration = Duration::from_secs(5);
-                const MAX_LATENCY: Duration = Duration::from_secs(5 * 60);
-                let latency = self.latency_observer.latency().unwrap_or(DEFAULT_LATENCY);
-                let latency = std::cmp::max(latency, DEFAULT_LATENCY);
-                let latency = std::cmp::min(latency, MAX_LATENCY);
-                self.metrics
-                    .sequencing_estimated_latency
-                    .set(latency.as_millis() as i64);
-                let delay_step = latency * 3 / 2;
-                (
-                    delay_step * position as u32,
-                    position,
-                    mapped_to_low_scoring,
-                )
-            }
-            _ => (Duration::ZERO, 0, false),
+        transactions: &[ConsensusTransaction],
+    ) -> (impl Future<Output = ()>, usize, usize, usize) {
+        if transactions.iter().any(|tx| tx.is_user_transaction()) {
+            // UserTransactions are generally sent to just one validator and should
+            // be submitted to consensus without delay.
+            return (tokio::time::sleep(Duration::ZERO), 0, 0, 0);
+        }
+
+        // Use the minimum digest to compute submit delay.
+        let min_digest = transactions
+            .iter()
+            .filter_map(|tx| match &tx.kind {
+                ConsensusTransactionKind::CertifiedTransaction(certificate) => {
+                    Some(certificate.digest())
+                }
+                _ => None,
+            })
+            .min();
+
+        let (duration, position, positions_moved, preceding_disconnected) = match min_digest {
+            Some(digest) => self.await_submit_delay_user_transaction(committee, digest),
+            _ => (Duration::ZERO, 0, 0, 0),
         };
         (
             tokio::time::sleep(duration),
             position,
-            mapped_to_low_scoring,
+            positions_moved,
+            preceding_disconnected,
         )
+    }
+
+    fn await_submit_delay_user_transaction(
+        &self,
+        committee: &Committee,
+        tx_digest: &TransactionDigest,
+    ) -> (Duration, usize, usize, usize) {
+        let (position, positions_moved, preceding_disconnected) =
+            self.submission_position(committee, tx_digest);
+
+        const DEFAULT_LATENCY: Duration = Duration::from_secs(1); // > p50 consensus latency with global deployment
+        const MIN_LATENCY: Duration = Duration::from_millis(150);
+        const MAX_LATENCY: Duration = Duration::from_secs(3);
+
+        let latency = self.latency_observer.latency().unwrap_or(DEFAULT_LATENCY);
+        self.metrics
+            .sequencing_estimated_latency
+            .set(latency.as_millis() as i64);
+
+        let latency = std::cmp::max(latency, MIN_LATENCY);
+        let latency = std::cmp::min(latency, MAX_LATENCY);
+        let latency = latency * 2;
+        let latency = self.override_by_throughput_profiler(position, latency);
+        let (delay_step, position) =
+            self.override_by_max_submit_position_settings(latency, position);
+
+        self.metrics
+            .sequencing_resubmission_interval_ms
+            .set(delay_step.as_millis() as i64);
+
+        (
+            delay_step * position as u32,
+            position,
+            positions_moved,
+            preceding_disconnected,
+        )
+    }
+
+    // According to the throughput profile we want to either allow some transaction duplication or not)
+    // When throughput profile is Low and the validator is in position = 1, then it will submit to consensus with much lower latency.
+    // When throughput profile is High then we go back to default operation and no-one co-submits.
+    fn override_by_throughput_profiler(&self, position: usize, latency: Duration) -> Duration {
+        const LOW_THROUGHPUT_DELAY_BEFORE_SUBMIT_MS: u64 = 0;
+        const MEDIUM_THROUGHPUT_DELAY_BEFORE_SUBMIT_MS: u64 = 2_500;
+        const HIGH_THROUGHPUT_DELAY_BEFORE_SUBMIT_MS: u64 = 3_500;
+
+        let p = self.consensus_throughput_profiler.load();
+
+        if let Some(profiler) = p.as_ref() {
+            let (level, _) = profiler.throughput_level();
+
+            // we only run this for the position = 1 validator to co-submit with the validator of
+            // position = 0. We also enable this only when the feature is enabled on the protocol config.
+            if self.protocol_config.throughput_aware_consensus_submission() && position == 1 {
+                return match level {
+                    Level::Low => Duration::from_millis(LOW_THROUGHPUT_DELAY_BEFORE_SUBMIT_MS),
+                    Level::Medium => {
+                        Duration::from_millis(MEDIUM_THROUGHPUT_DELAY_BEFORE_SUBMIT_MS)
+                    }
+                    Level::High => {
+                        let l = Duration::from_millis(HIGH_THROUGHPUT_DELAY_BEFORE_SUBMIT_MS);
+
+                        // back off according to recorded latency if it's significantly higher
+                        if latency >= 2 * l {
+                            latency
+                        } else {
+                            l
+                        }
+                    }
+                };
+            }
+        }
+        latency
+    }
+
+    /// Overrides the latency and the position if there are defined settings for `max_submit_position` and
+    /// `submit_delay_step_override`. If the `max_submit_position` has defined, then that will always be used
+    /// irrespective of any so far decision. Same for the `submit_delay_step_override`.
+    fn override_by_max_submit_position_settings(
+        &self,
+        latency: Duration,
+        mut position: usize,
+    ) -> (Duration, usize) {
+        // Respect any manual override for position and latency from the settings
+        if let Some(max_submit_position) = self.max_submit_position {
+            position = std::cmp::min(position, max_submit_position);
+        }
+
+        let delay_step = self.submit_delay_step_override.unwrap_or(latency);
+        (delay_step, position)
     }
 
     /// Check when this authority should submit the certificate to consensus.
@@ -410,8 +491,8 @@ impl ConsensusAdapter {
         &self,
         committee: &Committee,
         tx_digest: &TransactionDigest,
-    ) -> (usize, bool) {
-        let positions = order_validators_for_submission(committee, tx_digest);
+    ) -> (usize, usize, usize) {
+        let positions = committee.shuffle_by_stake_from_tx_digest(tx_digest);
 
         self.check_submission_wrt_connectivity_and_scores(positions)
     }
@@ -439,32 +520,47 @@ impl ConsensusAdapter {
     fn check_submission_wrt_connectivity_and_scores(
         &self,
         positions: Vec<AuthorityName>,
-    ) -> (usize, bool) {
+    ) -> (usize, usize, usize) {
         let low_scoring_authorities = self.low_scoring_authorities.load().load_full();
         if low_scoring_authorities.get(&self.authority).is_some() {
-            return (positions.len(), true);
+            return (positions.len(), 0, 0);
         }
         let initial_position = get_position_in_list(self.authority, positions.clone());
+        let mut preceding_disconnected = 0;
+        let mut before_our_position = true;
 
-        let filtered_positions = positions
+        let filtered_positions: Vec<_> = positions
             .into_iter()
             .filter(|authority| {
-                self.authority == *authority // Don't filter yourself out!
-                    ||
-                (
-                    self // Filter out any nodes that appear disconnected
-                        .connection_monitor_status
-                        .check_connection(&self.authority, authority)
-                        .unwrap_or(ConnectionStatus::Disconnected)
-                        == ConnectionStatus::Connected
-                    && // Filter out low scoring nodes
-                    low_scoring_authorities.get(authority).is_none()
-                )
+                let keep = self.authority == *authority; // don't filter ourself out
+                if keep {
+                    before_our_position = false;
+                }
+
+                // filter out any nodes that appear disconnected
+                let connected = self
+                    .connection_monitor_status
+                    .check_connection(&self.authority, authority)
+                    .unwrap_or(ConnectionStatus::Disconnected)
+                    == ConnectionStatus::Connected;
+                if !connected && before_our_position {
+                    preceding_disconnected += 1; // used for metrics
+                }
+
+                // Filter out low scoring nodes
+                let high_scoring = low_scoring_authorities.get(authority).is_none();
+
+                keep || (connected && high_scoring)
             })
             .collect();
 
         let position = get_position_in_list(self.authority, filtered_positions);
-        (position, position < initial_position)
+
+        (
+            position,
+            initial_position - position,
+            preceding_disconnected,
+        )
     }
 
     /// This method blocks until transaction is persisted in local database
@@ -480,8 +576,31 @@ impl ConsensusAdapter {
         lock: Option<&RwLockReadGuard<ReconfigState>>,
         epoch_store: &Arc<AuthorityPerEpochStore>,
     ) -> SuiResult<JoinHandle<()>> {
-        epoch_store.insert_pending_consensus_transactions(&transaction, lock)?;
-        Ok(self.submit_unchecked(transaction, epoch_store))
+        self.submit_batch(&[transaction], lock, epoch_store)
+    }
+
+    pub fn submit_batch(
+        self: &Arc<Self>,
+        transactions: &[ConsensusTransaction],
+        lock: Option<&RwLockReadGuard<ReconfigState>>,
+        epoch_store: &Arc<AuthorityPerEpochStore>,
+    ) -> SuiResult<JoinHandle<()>> {
+        if transactions.len() > 1 {
+            // In soft bundle, we need to check if all transactions are of CertifiedTransaction
+            // kind. The check is required because we assume this in submit_and_wait_inner.
+            for transaction in transactions {
+                fp_ensure!(
+                    matches!(
+                        transaction.kind,
+                        ConsensusTransactionKind::CertifiedTransaction(_)
+                    ),
+                    SuiError::InvalidTxKindInSoftBundle
+                );
+            }
+        }
+
+        epoch_store.insert_pending_consensus_transactions(transactions, lock)?;
+        Ok(self.submit_unchecked(transactions, epoch_store))
     }
 
     /// Performs weakly consistent checks on internal buffers to quickly
@@ -497,23 +616,32 @@ impl ConsensusAdapter {
         self.submit_semaphore.available_permits() > 0
     }
 
+    pub(crate) fn check_consensus_overload(&self) -> SuiResult {
+        fp_ensure!(
+            self.check_limits(),
+            SuiError::TooManyTransactionsPendingConsensus
+        );
+        Ok(())
+    }
+
     fn submit_unchecked(
         self: &Arc<Self>,
-        transaction: ConsensusTransaction,
+        transactions: &[ConsensusTransaction],
         epoch_store: &Arc<AuthorityPerEpochStore>,
     ) -> JoinHandle<()> {
         // Reconfiguration lock is dropped when pending_consensus_transactions is persisted, before it is handled by consensus
         let async_stage = self
             .clone()
-            .submit_and_wait(transaction, epoch_store.clone());
-        // Number of this tasks is limited by `sequencing_certificate_inflight` limit
+            .submit_and_wait(transactions.to_vec(), epoch_store.clone());
+        // Number of these tasks is weakly limited based on `num_inflight_transactions`.
+        // (Limit is not applied atomically, and only to user transactions.)
         let join_handle = spawn_monitored_task!(async_stage);
         join_handle
     }
 
     async fn submit_and_wait(
         self: Arc<Self>,
-        transaction: ConsensusTransaction,
+        transactions: Vec<ConsensusTransaction>,
         epoch_store: Arc<AuthorityPerEpochStore>,
     ) {
         // When epoch_terminated signal is received all pending submit_and_wait_inner are dropped.
@@ -528,7 +656,7 @@ impl ConsensusAdapter {
         // this means we might be sending transactions from previous epochs to narwhal of
         // new epoch if we have not had this barrier.
         epoch_store
-            .within_alive_epoch(self.submit_and_wait_inner(transaction, &epoch_store))
+            .within_alive_epoch(self.submit_and_wait_inner(transactions, &epoch_store))
             .await
             .ok(); // result here indicates if epoch ended earlier, we don't care about it
     }
@@ -536,39 +664,74 @@ impl ConsensusAdapter {
     #[allow(clippy::option_map_unit_fn)]
     async fn submit_and_wait_inner(
         self: Arc<Self>,
-        transaction: ConsensusTransaction,
+        transactions: Vec<ConsensusTransaction>,
         epoch_store: &Arc<AuthorityPerEpochStore>,
     ) {
-        if matches!(transaction.kind, ConsensusTransactionKind::EndOfPublish(..)) {
-            info!(epoch=?epoch_store.epoch(), "Submitting EndOfPublish message to Narwhal");
-            epoch_store.record_epoch_pending_certs_process_time_metric();
+        if transactions.is_empty() {
+            return;
         }
 
-        let transaction_key = SequencedConsensusTransactionKey::External(transaction.key());
-        let processed_waiter = epoch_store
-            .consensus_message_processed_notify(transaction_key)
-            .boxed();
+        // Current code path ensures:
+        // - If transactions.len() > 1, it is a soft bundle. Otherwise transactions should have been submitted individually.
+        // - If is_soft_bundle, then all transactions are of UserTransaction kind.
+        // - If not is_soft_bundle, then transactions must contain exactly 1 tx, and transactions[0] can be of any kind.
+        let is_soft_bundle = transactions.len() > 1;
 
-        let (await_submit, position, mapped_to_low_scoring) =
-            self.await_submit_delay(epoch_store.committee(), &transaction);
-        let mut guard = InflightDropGuard::acquire(&self);
+        let mut transaction_keys = Vec::new();
 
-        // We need to wait for some delay until we submit transaction to the consensus
-        // However, if transaction is received by consensus while we wait, we don't need to wait
-        let processed_waiter = match select(processed_waiter, await_submit.boxed()).await {
-            Either::Left((processed, _await_submit)) => {
-                processed.expect("Storage error when waiting for consensus message processed");
+        for transaction in &transactions {
+            if matches!(transaction.kind, ConsensusTransactionKind::EndOfPublish(..)) {
+                info!(epoch=?epoch_store.epoch(), "Submitting EndOfPublish message to consensus");
+                epoch_store.record_epoch_pending_certs_process_time_metric();
+            }
+
+            let transaction_key = SequencedConsensusTransactionKey::External(transaction.key());
+            transaction_keys.push(transaction_key);
+        }
+        let tx_type = if !is_soft_bundle {
+            classify(&transactions[0])
+        } else {
+            "soft_bundle"
+        };
+
+        let mut guard = InflightDropGuard::acquire(&self, tx_type);
+
+        // Create the waiter until the node's turn comes to submit to consensus
+        let (await_submit, position, positions_moved, preceding_disconnected) =
+            self.await_submit_delay(epoch_store.committee(), &transactions[..]);
+
+        // Create the waiter until the transaction is processed by consensus or via checkpoint
+        let processed_via_consensus_or_checkpoint =
+            self.await_consensus_or_checkpoint(transaction_keys.clone(), epoch_store);
+        pin_mut!(processed_via_consensus_or_checkpoint);
+
+        let processed_waiter = tokio::select! {
+            // We need to wait for some delay until we submit transaction to the consensus
+            _ = await_submit => Some(processed_via_consensus_or_checkpoint),
+
+            // If epoch ends, don't wait for submit delay
+            _ = epoch_store.user_certs_closed_notify() => {
+                warn!(epoch = ?epoch_store.epoch(), "Epoch ended, skipping submission delay");
+                Some(processed_via_consensus_or_checkpoint)
+            }
+
+            // If transaction is received by consensus or checkpoint while we wait, we are done.
+            _ = &mut processed_via_consensus_or_checkpoint => {
                 None
             }
-            Either::Right(((), processed_waiter)) => Some(processed_waiter),
         };
-        let transaction_key = transaction.key();
-        // Log warnings for capability or end of publish transactions that fail to get sequenced
-        let _monitor = if matches!(
-            transaction.kind,
-            ConsensusTransactionKind::EndOfPublish(_)
-                | ConsensusTransactionKind::CapabilityNotification(_)
-        ) {
+
+        // Log warnings for administrative transactions that fail to get sequenced
+        let _monitor = if !is_soft_bundle
+            && matches!(
+                transactions[0].kind,
+                ConsensusTransactionKind::EndOfPublish(_)
+                    | ConsensusTransactionKind::CapabilityNotification(_)
+                    | ConsensusTransactionKind::CapabilityNotificationV2(_)
+                    | ConsensusTransactionKind::RandomnessDkgMessage(_, _)
+                    | ConsensusTransactionKind::RandomnessDkgConfirmation(_, _)
+            ) {
+            let transaction_keys = transaction_keys.clone();
             Some(CancelOnDrop(spawn_monitored_task!(async {
                 let mut i = 0u64;
                 loop {
@@ -576,19 +739,24 @@ impl ConsensusAdapter {
                     const WARN_DELAY_S: u64 = 30;
                     tokio::time::sleep(Duration::from_secs(WARN_DELAY_S)).await;
                     let total_wait = i * WARN_DELAY_S;
-                    warn!("Still waiting {total_wait} seconds for transaction {transaction_key:?} to commit in narwhal");
+                    warn!(
+                        "Still waiting {} seconds for transactions {:?} to commit in consensus",
+                        total_wait, transaction_keys
+                    );
                 }
             })))
         } else {
             None
         };
+
         if let Some(processed_waiter) = processed_waiter {
-            debug!("Submitting {transaction_key:?} to consensus");
+            debug!("Submitting {:?} to consensus", transaction_keys);
 
             // populate the position only when this authority submits the transaction
             // to consensus
             guard.position = Some(position);
-            guard.mapped_to_low_scoring = mapped_to_low_scoring;
+            guard.positions_moved = Some(positions_moved);
+            guard.preceding_disconnected = Some(preceding_disconnected);
 
             let _permit: SemaphorePermit = self
                 .submit_semaphore
@@ -606,20 +774,31 @@ impl ConsensusAdapter {
                 let mut retries: u32 = 0;
                 while let Err(e) = self
                     .consensus_client
-                    .submit_to_consensus(&transaction, epoch_store)
+                    .submit_to_consensus(&transactions[..], epoch_store)
                     .await
                 {
-                    // This can happen during Narwhal reconfig, or when the Narwhal worker has
-                    // full internal buffers and needs to back pressure, so retry a few times.
-                    if retries > 3 {
+                    // This can happen during reconfig, or when consensus has full internal buffers
+                    // and needs to back pressure, so retry a few times before logging warnings.
+                    if retries > 30
+                        || (retries > 3 && (is_soft_bundle || !transactions[0].kind.is_dkg()))
+                    {
                         warn!(
-                            "Failed to submit transaction {:?} to own narwhal worker: {:?}. Retry #{}",
-                            transaction_key, e, retries,
+                            "Failed to submit transactions {transaction_keys:?} to consensus: {e:?}. Retry #{retries}"
                         );
                     }
-                    self.metrics.sequencing_certificate_failures.inc();
+                    self.metrics
+                        .sequencing_certificate_failures
+                        .with_label_values(&[tx_type])
+                        .inc();
                     retries += 1;
-                    time::sleep(Duration::from_secs(10)).await;
+
+                    if !is_soft_bundle && transactions[0].kind.is_dkg() {
+                        // Shorter delay for DKG messages, which are time-sensitive and happen at
+                        // start-of-epoch when submit errors due to active reconfig are likely.
+                        time::sleep(Duration::from_millis(100)).await;
+                    } else {
+                        time::sleep(Duration::from_secs(10)).await;
+                    };
                 }
 
                 // we want to record the num of retries when reporting latency but to avoid label
@@ -635,32 +814,41 @@ impl ConsensusAdapter {
 
                 self.metrics
                     .sequencing_acknowledge_latency
-                    .with_label_values(&[&bucket])
+                    .with_label_values(&[&bucket, tx_type])
                     .observe(ack_start.elapsed().as_secs_f64());
             };
             match select(processed_waiter, submit_inner.boxed()).await {
                 Either::Left((processed, _submit_inner)) => processed,
                 Either::Right(((), processed_waiter)) => {
-                    debug!("Submitted {transaction_key:?} to consensus");
+                    debug!("Submitted {transaction_keys:?} to consensus");
                     processed_waiter.await
                 }
             }
-            .expect("Storage error when waiting for consensus message processed");
         }
-        debug!("{transaction_key:?} processed by consensus");
+        debug!("{transaction_keys:?} processed by consensus");
+
+        let consensus_keys: Vec<_> = transactions.iter().map(|t| t.key()).collect();
         epoch_store
-            .remove_pending_consensus_transaction(&transaction.key())
+            .remove_pending_consensus_transactions(&consensus_keys)
             .expect("Storage error when removing consensus transaction");
-        let send_end_of_publish = if let ConsensusTransactionKind::UserTransaction(_cert) =
-            &transaction.kind
-        {
-            let reconfig_guard = epoch_store.get_reconfig_state_read_lock_guard();
+
+        let is_user_tx = is_soft_bundle
+            || matches!(
+                transactions[0].kind,
+                ConsensusTransactionKind::CertifiedTransaction(_)
+            );
+        let send_end_of_publish = if is_user_tx {
             // If we are in RejectUserCerts state and we just drained the list we need to
             // send EndOfPublish to signal other validators that we are not submitting more certificates to the epoch.
             // Note that there could be a race condition here where we enter this check in RejectAllCerts state.
             // In that case we don't need to send EndOfPublish because condition to enter
             // RejectAllCerts is when 2f+1 other validators already sequenced their EndOfPublish message.
-            if reconfig_guard.is_reject_user_certs() {
+            // Also note that we could sent multiple EndOfPublish due to that multiple tasks can enter here with
+            // pending_count == 0. This doesn't affect correctness.
+            if epoch_store
+                .get_reconfig_state_read_lock_guard()
+                .is_reject_user_certs()
+            {
                 let pending_count = epoch_store.pending_consensus_certificates_count();
                 debug!(epoch=?epoch_store.epoch(), ?pending_count, "Deciding whether to send EndOfPublish");
                 pending_count == 0 // send end of epoch if empty
@@ -672,6 +860,7 @@ impl ConsensusAdapter {
         };
         if send_end_of_publish {
             // sending message outside of any locks scope
+            info!(epoch=?epoch_store.epoch(), "Sending EndOfPublish message to consensus");
             if let Err(err) = self.submit(
                 ConsensusTransaction::new_end_of_publish(self.authority),
                 None,
@@ -680,7 +869,47 @@ impl ConsensusAdapter {
                 warn!("Error when sending end of publish message: {:?}", err);
             }
         }
-        self.metrics.sequencing_certificate_success.inc();
+        self.metrics
+            .sequencing_certificate_success
+            .with_label_values(&[tx_type])
+            .inc();
+    }
+
+    /// Waits for transactions to appear either to consensus output or been executed via a checkpoint (state sync).
+    async fn await_consensus_or_checkpoint(
+        self: &Arc<Self>,
+        transaction_keys: Vec<SequencedConsensusTransactionKey>,
+        epoch_store: &Arc<AuthorityPerEpochStore>,
+    ) {
+        let notifications = FuturesUnordered::new();
+        for transaction_key in transaction_keys {
+            let transaction_digests = if let SequencedConsensusTransactionKey::External(
+                ConsensusTransactionKey::Certificate(digest),
+            ) = transaction_key
+            {
+                vec![digest]
+            } else {
+                vec![]
+            };
+
+            // We wait for each transaction individually to be processed by consensus or executed in a checkpoint. We could equally just
+            // get notified in aggregate when all transactions are processed, but with this approach can get notified in a more fine-grained way
+            // as transactions can be marked as processed in different ways. This is mostly a concern for the soft-bundle transactions.
+            notifications.push(async move {
+                tokio::select! {
+                    processed = epoch_store.consensus_messages_processed_notify(vec![transaction_key]) => {
+                        processed.expect("Storage error when waiting for consensus message processed");
+                        self.metrics.sequencing_certificate_processed.with_label_values(&["consensus"]).inc();
+                    },
+                    processed = epoch_store.transactions_executed_in_checkpoint_notify(transaction_digests), if !transaction_digests.is_empty() => {
+                        processed.expect("Storage error when waiting for transaction executed in checkpoint");
+                        self.metrics.sequencing_certificate_processed.with_label_values(&["checkpoint"]).inc();
+                    }
+                }
+            });
+        }
+
+        notifications.collect::<Vec<()>>().await;
     }
 }
 
@@ -751,18 +980,6 @@ pub fn get_position_in_list(
         .0
 }
 
-pub fn order_validators_for_submission(
-    committee: &Committee,
-    tx_digest: &TransactionDigest,
-) -> Vec<AuthorityName> {
-    // the 32 is as requirement of the default StdRng::from_seed choice
-    let digest_bytes = tx_digest.into_inner();
-
-    // permute the validators deterministically, based on the digest
-    let mut rng = StdRng::from_seed(digest_bytes);
-    committee.shuffle_by_stake_with_rng(None, None, &mut rng)
-}
-
 impl ReconfigurationInitiator for Arc<ConsensusAdapter> {
     /// This method is called externally to begin reconfiguration
     /// It transition reconfig state to reject new certificates from user
@@ -779,8 +996,10 @@ impl ReconfigurationInitiator for Arc<ConsensusAdapter> {
             let send_end_of_publish = pending_count == 0;
             epoch_store.close_user_certs(reconfig_guard);
             send_end_of_publish
+            // reconfig_guard lock is dropped here.
         };
         if send_end_of_publish {
+            info!(epoch=?epoch_store.epoch(), "Sending EndOfPublish message to consensus");
             if let Err(err) = self.submit(
                 ConsensusTransaction::new_end_of_publish(self.authority),
                 None,
@@ -813,39 +1032,47 @@ struct InflightDropGuard<'a> {
     adapter: &'a ConsensusAdapter,
     start: Instant,
     position: Option<usize>,
-    mapped_to_low_scoring: bool,
+    positions_moved: Option<usize>,
+    preceding_disconnected: Option<usize>,
+    tx_type: &'static str,
 }
 
 impl<'a> InflightDropGuard<'a> {
-    pub fn acquire(adapter: &'a ConsensusAdapter) -> Self {
-        let inflight = adapter
+    pub fn acquire(adapter: &'a ConsensusAdapter, tx_type: &'static str) -> Self {
+        adapter
             .num_inflight_transactions
             .fetch_add(1, Ordering::SeqCst);
-        adapter.metrics.sequencing_certificate_attempt.inc();
         adapter
             .metrics
             .sequencing_certificate_inflight
-            .set(inflight as i64);
+            .with_label_values(&[tx_type])
+            .inc();
+        adapter
+            .metrics
+            .sequencing_certificate_attempt
+            .with_label_values(&[tx_type])
+            .inc();
         Self {
             adapter,
             start: Instant::now(),
             position: None,
-            mapped_to_low_scoring: false,
+            positions_moved: None,
+            preceding_disconnected: None,
+            tx_type,
         }
     }
 }
 
 impl<'a> Drop for InflightDropGuard<'a> {
     fn drop(&mut self) {
-        let inflight = self
-            .adapter
+        self.adapter
             .num_inflight_transactions
             .fetch_sub(1, Ordering::SeqCst);
-        // Store the latest latency
         self.adapter
             .metrics
             .sequencing_certificate_inflight
-            .set(inflight as i64);
+            .with_label_values(&[self.tx_type])
+            .dec();
 
         let position = if let Some(position) = self.position {
             self.adapter
@@ -857,71 +1084,53 @@ impl<'a> Drop for InflightDropGuard<'a> {
             "not_submitted".to_string()
         };
 
+        if let Some(positions_moved) = self.positions_moved {
+            self.adapter
+                .metrics
+                .sequencing_certificate_positions_moved
+                .observe(positions_moved as f64);
+        };
+
+        if let Some(preceding_disconnected) = self.preceding_disconnected {
+            self.adapter
+                .metrics
+                .sequencing_certificate_preceding_disconnected
+                .observe(preceding_disconnected as f64);
+        };
+
         let latency = self.start.elapsed();
-        if self.position == Some(0) {
-            self.adapter.latency_observer.report(latency);
-        }
         self.adapter
             .metrics
             .sequencing_certificate_latency
-            .with_label_values(&[&position, &format!("{:?}", self.mapped_to_low_scoring)])
+            .with_label_values(&[&position, self.tx_type])
             .observe(latency.as_secs_f64());
-    }
-}
 
-struct LatencyObserver {
-    data: Mutex<LatencyObserverInner>,
-    latency_ms: AtomicU64,
-}
-
-#[derive(Default)]
-struct LatencyObserverInner {
-    points: VecDeque<Duration>,
-    sum: Duration,
-}
-
-impl LatencyObserver {
-    pub fn new() -> Self {
-        Self {
-            data: Mutex::new(LatencyObserverInner::default()),
-            latency_ms: AtomicU64::new(u64::MAX),
-        }
-    }
-
-    pub fn report(&self, latency: Duration) {
-        const MAX_SAMPLES: usize = 64;
-        let mut data = self.data.lock();
-        data.points.push_back(latency);
-        data.sum += latency;
-        if data.points.len() >= MAX_SAMPLES {
-            let pop = data.points.pop_front().expect("data vector is not empty");
-            data.sum -= pop; // This does not overflow because of how running sum is calculated
-        }
-        let latency = data.sum.as_millis() as u64 / data.points.len() as u64;
-        self.latency_ms.store(latency, Ordering::Relaxed);
-    }
-
-    pub fn latency(&self) -> Option<Duration> {
-        let latency = self.latency_ms.load(Ordering::Relaxed);
-        if latency == u64::MAX {
-            // Not initialized yet (0 data points)
-            None
-        } else {
-            Some(Duration::from_millis(latency))
+        // Only sample latency after consensus quorum is up. Otherwise, the wait for consensus
+        // quorum at the beginning of an epoch can distort the sampled latencies.
+        // Technically there are more system transaction types that can be included in samples
+        // after the first consensus commit, but this set of types should be enough.
+        if self.position == Some(0) {
+            // Transaction types below require quorum existed in the current epoch.
+            // TODO: refactor tx_type to enum.
+            let sampled = matches!(
+                self.tx_type,
+                "shared_certificate" | "owned_certificate" | "checkpoint_signature" | "soft_bundle"
+            );
+            if sampled {
+                self.adapter.latency_observer.report(latency);
+            }
         }
     }
 }
-
-use crate::consensus_handler::SequencedConsensusTransactionKey;
 
 #[async_trait::async_trait]
 impl SubmitToConsensus for Arc<ConsensusAdapter> {
     async fn submit_to_consensus(
         &self,
-        transaction: &ConsensusTransaction,
+        transactions: &[ConsensusTransaction],
         epoch_store: &Arc<AuthorityPerEpochStore>,
     ) -> SuiResult {
-        self.submit(transaction.clone(), None, epoch_store)
+        self.submit_batch(transactions, None, epoch_store)
             .map(|_| ())
     }
 }
@@ -931,42 +1140,109 @@ pub fn position_submit_certificate(
     ourselves: &AuthorityName,
     tx_digest: &TransactionDigest,
 ) -> usize {
-    let validators = order_validators_for_submission(committee, tx_digest);
+    let validators = committee.shuffle_by_stake_from_tx_digest(tx_digest);
     get_position_in_list(*ourselves, validators)
 }
 
 #[cfg(test)]
 mod adapter_tests {
     use super::position_submit_certificate;
+    use crate::consensus_adapter::{
+        ConnectionMonitorStatusForTests, ConsensusAdapter, ConsensusAdapterMetrics,
+    };
+    use crate::mysticeti_adapter::LazyMysticetiClient;
     use fastcrypto::traits::KeyPair;
-    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use rand::Rng;
+    use rand::{rngs::StdRng, SeedableRng};
+    use std::sync::Arc;
+    use std::time::Duration;
     use sui_types::{
         base_types::TransactionDigest,
         committee::Committee,
         crypto::{get_key_pair_from_rng, AuthorityKeyPair, AuthorityPublicKeyBytes},
     };
 
-    #[test]
-    fn test_position_submit_certificate() {
-        // grab a random committee and a random stake distribution
-        let mut rng = StdRng::from_seed([0; 32]);
-        const COMMITTEE_SIZE: usize = 10; // 3 * 3 + 1;
-        let authorities = (0..COMMITTEE_SIZE)
+    fn test_committee(rng: &mut StdRng, size: usize) -> Committee {
+        let authorities = (0..size)
             .map(|_k| {
                 (
                     AuthorityPublicKeyBytes::from(
-                        get_key_pair_from_rng::<AuthorityKeyPair, _>(&mut rng)
-                            .1
-                            .public(),
+                        get_key_pair_from_rng::<AuthorityKeyPair, _>(rng).1.public(),
                     ),
                     rng.gen_range(0u64..10u64),
                 )
             })
             .collect::<Vec<_>>();
-        let committee = Committee::new_for_testing_with_normalized_voting_power(
+        Committee::new_for_testing_with_normalized_voting_power(
             0,
             authorities.iter().cloned().collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_await_submit_delay_user_transaction() {
+        // grab a random committee and a random stake distribution
+        let mut rng = StdRng::from_seed([0; 32]);
+        let committee = test_committee(&mut rng, 10);
+
+        // When we define max submit position and delay step
+        let consensus_adapter = ConsensusAdapter::new(
+            Arc::new(LazyMysticetiClient::new()),
+            *committee.authority_by_index(0).unwrap(),
+            Arc::new(ConnectionMonitorStatusForTests {}),
+            100_000,
+            100_000,
+            Some(1),
+            Some(Duration::from_secs(2)),
+            ConsensusAdapterMetrics::new_test(),
+            sui_protocol_config::ProtocolConfig::get_for_max_version_UNSAFE(),
         );
+
+        // transaction to submit
+        let tx_digest = TransactionDigest::generate(&mut rng);
+
+        // Ensure that the original position is higher
+        let (position, positions_moved, _) =
+            consensus_adapter.submission_position(&committee, &tx_digest);
+        assert_eq!(position, 7);
+        assert!(!positions_moved > 0);
+
+        // Make sure that position is set to max value 0
+        let (delay_step, position, positions_moved, _) =
+            consensus_adapter.await_submit_delay_user_transaction(&committee, &tx_digest);
+
+        assert_eq!(position, 1);
+        assert_eq!(delay_step, Duration::from_secs(2));
+        assert!(!positions_moved > 0);
+
+        // Without submit position and delay step
+        let consensus_adapter = ConsensusAdapter::new(
+            Arc::new(LazyMysticetiClient::new()),
+            *committee.authority_by_index(0).unwrap(),
+            Arc::new(ConnectionMonitorStatusForTests {}),
+            100_000,
+            100_000,
+            None,
+            None,
+            ConsensusAdapterMetrics::new_test(),
+            sui_protocol_config::ProtocolConfig::get_for_max_version_UNSAFE(),
+        );
+
+        let (delay_step, position, positions_moved, _) =
+            consensus_adapter.await_submit_delay_user_transaction(&committee, &tx_digest);
+
+        assert_eq!(position, 7);
+
+        // delay_step * position * 2 = 1 * 7 * 2 = 14
+        assert_eq!(delay_step, Duration::from_secs(14));
+        assert!(!positions_moved > 0);
+    }
+
+    #[test]
+    fn test_position_submit_certificate() {
+        // grab a random committee and a random stake distribution
+        let mut rng = StdRng::from_seed([0; 32]);
+        let committee = test_committee(&mut rng, 10);
 
         // generate random transaction digests, and account for validator selection
         const NUM_TEST_TRANSACTIONS: usize = 1000;
@@ -975,7 +1251,7 @@ mod adapter_tests {
             let tx_digest = TransactionDigest::generate(&mut rng);
 
             let mut zero_found = false;
-            for (name, _) in authorities.iter() {
+            for (name, _) in committee.members() {
                 let f = position_submit_certificate(&committee, name, &tx_digest);
                 assert!(f < committee.num_members());
                 if f == 0 {

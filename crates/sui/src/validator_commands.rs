@@ -8,8 +8,10 @@ use std::{
     fmt::{self, Debug, Display, Formatter, Write},
     fs,
     path::PathBuf,
+    sync::Arc,
 };
-use sui_config::genesis::GenesisValidatorInfo;
+use sui_genesis_builder::validator_info::GenesisValidatorInfo;
+use url::{ParseError, Url};
 
 use sui_types::{
     base_types::{ObjectID, ObjectRef, SuiAddress},
@@ -24,7 +26,6 @@ use sui_types::{
 };
 use tap::tap::TapOptional;
 
-use crate::client_commands::WalletContext;
 use crate::fire_drill::get_gas_obj_ref;
 use clap::*;
 use colored::Colorize;
@@ -35,10 +36,14 @@ use fastcrypto::{
 };
 use serde::Serialize;
 use shared_crypto::intent::{Intent, IntentMessage, IntentScope};
+use sui_bridge::metrics::BridgeMetrics;
+use sui_bridge::sui_client::SuiClient as SuiBridgeClient;
+use sui_bridge::sui_transaction_builder::{
+    build_committee_register_transaction, build_committee_update_url_transaction,
+};
 use sui_json_rpc_types::{
     SuiObjectDataOptions, SuiTransactionBlockResponse, SuiTransactionBlockResponseOptions,
 };
-use sui_keys::keystore::AccountKeystore;
 use sui_keys::{
     key_derive::generate_new_key,
     keypair_file::{
@@ -46,16 +51,18 @@ use sui_keys::{
         write_authority_keypair_to_file, write_keypair_to_file,
     },
 };
+use sui_keys::{keypair_file::read_key, keystore::AccountKeystore};
+use sui_sdk::wallet_context::WalletContext;
 use sui_sdk::SuiClient;
 use sui_types::crypto::{
     generate_proof_of_possession, get_authority_key_pair, AuthorityPublicKeyBytes,
 };
-use sui_types::messages::Transaction;
-use sui_types::messages::{CallArg, ObjectArg, TransactionData};
-use sui_types::{
-    crypto::{AuthorityKeyPair, NetworkKeyPair, SignatureScheme, SuiKeyPair},
-    SUI_SYSTEM_OBJ_CALL_ARG,
-};
+use sui_types::crypto::{AuthorityKeyPair, NetworkKeyPair, SignatureScheme, SuiKeyPair};
+use sui_types::transaction::{CallArg, ObjectArg, Transaction, TransactionData};
+
+#[path = "unit_tests/validator_tests.rs"]
+#[cfg(test)]
+mod validator_tests;
 
 const DEFAULT_GAS_BUDGET: u64 = 200_000_000; // 0.2 SUI
 
@@ -148,6 +155,57 @@ pub enum SuiValidatorCommand {
         #[clap(name = "protocol-public-key", long)]
         protocol_public_key: AuthorityPublicKeyBytes,
     },
+    /// Print out the serialized data of a transaction that sets the gas price quote for a validator.
+    DisplayGasPriceUpdateRawTxn {
+        /// Address of the transaction sender.
+        #[clap(name = "sender-address", long)]
+        sender_address: SuiAddress,
+        /// Object ID of a validator's OperationCap, used for setting gas price and reportng validators.
+        #[clap(name = "operation-cap-id", long)]
+        operation_cap_id: ObjectID,
+        /// Gas price to be set to.
+        #[clap(name = "new-gas-price", long)]
+        new_gas_price: u64,
+        /// Gas budget for this transaction.
+        #[clap(name = "gas-budget", long)]
+        gas_budget: Option<u64>,
+    },
+    /// Sui native bridge committee member registration
+    #[clap(name = "register-bridge-committee")]
+    RegisterBridgeCommittee {
+        /// Path to Bridge Authority Key file.
+        #[clap(long)]
+        bridge_authority_key_path: PathBuf,
+        /// Bridge authority URL which clients collects action signatures from.
+        #[clap(long)]
+        bridge_authority_url: String,
+        /// If true, only print the unsigned transaction and do not execute it.
+        /// This is useful for offline signing.
+        #[clap(name = "print-only", long, default_value = "false")]
+        print_unsigned_transaction_only: bool,
+        /// Must present if `print_unsigned_transaction_only` is true.
+        #[clap(long)]
+        validator_address: Option<SuiAddress>,
+        /// Gas budget for this transaction.
+        #[clap(name = "gas-budget", long)]
+        gas_budget: Option<u64>,
+    },
+    /// Update sui native bridge committee node url
+    UpdateBridgeCommitteeNodeUrl {
+        /// New node url to be registered in the on chain bridge object.
+        #[clap(long)]
+        bridge_authority_url: String,
+        /// If true, only print the unsigned transaction and do not execute it.
+        /// This is useful for offline signing.
+        #[clap(name = "print-only", long, default_value = "false")]
+        print_unsigned_transaction_only: bool,
+        /// Must be present if `print_unsigned_transaction_only` is true.
+        #[clap(long)]
+        validator_address: Option<SuiAddress>,
+        /// Gas budget for this transaction.
+        #[clap(name = "gas-budget", long)]
+        gas_budget: Option<u64>,
+    },
 }
 
 #[derive(Serialize)]
@@ -162,13 +220,25 @@ pub enum SuiValidatorCommandResponse {
     UpdateGasPrice(SuiTransactionBlockResponse),
     ReportValidator(SuiTransactionBlockResponse),
     SerializedPayload(String),
+    DisplayGasPriceUpdateRawTxn {
+        data: TransactionData,
+        serialized_data: String,
+    },
+    RegisterBridgeCommittee {
+        execution_response: Option<SuiTransactionBlockResponse>,
+        serialized_unsigned_transaction: Option<String>,
+    },
+    UpdateBridgeCommitteeURL {
+        execution_response: Option<SuiTransactionBlockResponse>,
+        serialized_unsigned_transaction: Option<String>,
+    },
 }
 
 fn make_key_files(
     file_name: PathBuf,
     is_protocol_key: bool,
     key: Option<SuiKeyPair>,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     if file_name.exists() {
         println!("Use existing {:?} key file.", file_name);
         return Ok(());
@@ -238,14 +308,14 @@ impl SuiValidatorCommand {
                 let pop =
                     generate_proof_of_possession(&keypair, (&account_keypair.public()).into());
                 let validator_info = GenesisValidatorInfo {
-                    info: sui_config::ValidatorInfo {
+                    info: sui_genesis_builder::validator_info::ValidatorInfo {
                         name,
                         protocol_key: keypair.public().into(),
                         worker_key: worker_keypair.public().clone(),
                         account_address: SuiAddress::from(&account_keypair.public()),
                         network_key: network_keypair.public().clone(),
                         gas_price,
-                        commission_rate: sui_config::ValidatorInfo::DEFAULT_COMMISSION_RATE,
+                        commission_rate: sui_config::node::DEFAULT_COMMISSION_RATE,
                         network_address: Multiaddr::try_from(format!(
                             "/dns/{}/tcp/8080/http",
                             host_name
@@ -267,7 +337,7 @@ impl SuiValidatorCommand {
                 };
                 // TODO set key files permission
                 let validator_info_file_name = dir.join("validator.info");
-                let validator_info_bytes = serde_yaml::to_vec(&validator_info)?;
+                let validator_info_bytes = serde_yaml::to_string(&validator_info)?;
                 fs::write(validator_info_file_name.clone(), validator_info_bytes)?;
                 println!(
                     "Generated validator info file: {:?}.",
@@ -406,8 +476,217 @@ impl SuiValidatorCommand {
                 DEFAULT_EPOCH_ID.write(&mut intent_msg_bytes);
                 SuiValidatorCommandResponse::SerializedPayload(Base64::encode(&intent_msg_bytes))
             }
+
+            SuiValidatorCommand::DisplayGasPriceUpdateRawTxn {
+                sender_address,
+                operation_cap_id,
+                new_gas_price,
+                gas_budget,
+            } => {
+                let gas_budget = gas_budget.unwrap_or(DEFAULT_GAS_BUDGET);
+                let (_status, _summary, cap_obj_ref) =
+                    get_cap_object_ref(context, Some(operation_cap_id)).await?;
+
+                let args = vec![
+                    CallArg::Object(ObjectArg::ImmOrOwnedObject(cap_obj_ref)),
+                    CallArg::Pure(bcs::to_bytes(&new_gas_price).unwrap()),
+                ];
+                let data = construct_unsigned_0x5_txn(
+                    context,
+                    sender_address,
+                    "request_set_gas_price",
+                    args,
+                    gas_budget,
+                )
+                .await?;
+                let serialized_data = Base64::encode(bcs::to_bytes(&data)?);
+                SuiValidatorCommandResponse::DisplayGasPriceUpdateRawTxn {
+                    data,
+                    serialized_data,
+                }
+            }
+            SuiValidatorCommand::RegisterBridgeCommittee {
+                bridge_authority_key_path,
+                bridge_authority_url,
+                print_unsigned_transaction_only,
+                validator_address,
+                gas_budget,
+            } => {
+                let parsed_url =
+                    Url::parse(&bridge_authority_url).map_err(|e: ParseError| anyhow!(e))?;
+                if parsed_url.scheme() != "http" && parsed_url.scheme() != "https" {
+                    anyhow::bail!(
+                        "URL scheme has to be http or https: {}",
+                        parsed_url.scheme()
+                    );
+                }
+                // Read bridge keypair
+                let ecdsa_keypair = match read_key(&bridge_authority_key_path, true)? {
+                    SuiKeyPair::Secp256k1(key) => key,
+                    _ => unreachable!("we required secp256k1 key in `read_key`"),
+                };
+                let address = check_address(
+                    context.active_address()?,
+                    validator_address,
+                    print_unsigned_transaction_only,
+                )?;
+                // Make sure the address is a validator
+                let sui_client = context.get_client().await?;
+                let active_validators = sui_client
+                    .governance_api()
+                    .get_latest_sui_system_state()
+                    .await?
+                    .active_validators;
+                if !active_validators
+                    .into_iter()
+                    .any(|s| s.sui_address == address)
+                {
+                    bail!("Address {} is not in the committee", address);
+                }
+                println!("Starting bridge committee registration for Sui validator: {address}, with bridge public key: {} and url: {}", ecdsa_keypair.public, bridge_authority_url);
+                let sui_rpc_url = &context.config.get_active_env().unwrap().rpc;
+                let bridge_metrics = Arc::new(BridgeMetrics::new_for_testing());
+                let bridge_client = SuiBridgeClient::new(sui_rpc_url, bridge_metrics).await?;
+                let bridge = bridge_client
+                    .get_mutable_bridge_object_arg_must_succeed()
+                    .await;
+
+                let gas_budget = gas_budget.unwrap_or(DEFAULT_GAS_BUDGET);
+                let (_, gas) = context
+                    .gas_for_owner_budget(address, gas_budget, Default::default())
+                    .await?;
+
+                let gas_price = context.get_reference_gas_price().await?;
+                let tx_data = build_committee_register_transaction(
+                    address,
+                    &gas.object_ref(),
+                    bridge,
+                    ecdsa_keypair.public().as_bytes().to_vec(),
+                    &bridge_authority_url,
+                    gas_price,
+                    gas_budget,
+                )
+                .map_err(|e| anyhow!("{e:?}"))?;
+                if print_unsigned_transaction_only {
+                    let serialized_data = Base64::encode(bcs::to_bytes(&tx_data)?);
+                    SuiValidatorCommandResponse::RegisterBridgeCommittee {
+                        execution_response: None,
+                        serialized_unsigned_transaction: Some(serialized_data),
+                    }
+                } else {
+                    let tx = context.sign_transaction(&tx_data);
+                    let response = context.execute_transaction_must_succeed(tx).await;
+                    println!(
+                        "Committee registration successful. Transaction digest: {}",
+                        response.digest
+                    );
+                    SuiValidatorCommandResponse::RegisterBridgeCommittee {
+                        execution_response: Some(response),
+                        serialized_unsigned_transaction: None,
+                    }
+                }
+            }
+            SuiValidatorCommand::UpdateBridgeCommitteeNodeUrl {
+                bridge_authority_url,
+                print_unsigned_transaction_only,
+                validator_address,
+                gas_budget,
+            } => {
+                let parsed_url =
+                    Url::parse(&bridge_authority_url).map_err(|e: ParseError| anyhow!(e))?;
+                if parsed_url.scheme() != "http" && parsed_url.scheme() != "https" {
+                    anyhow::bail!(
+                        "URL scheme has to be http or https: {}",
+                        parsed_url.scheme()
+                    );
+                }
+                // Make sure the address is member of the committee
+                let address = check_address(
+                    context.active_address()?,
+                    validator_address,
+                    print_unsigned_transaction_only,
+                )?;
+                let sui_rpc_url = &context.config.get_active_env().unwrap().rpc;
+                let bridge_metrics = Arc::new(BridgeMetrics::new_for_testing());
+                let bridge_client = SuiBridgeClient::new(sui_rpc_url, bridge_metrics).await?;
+                let committee_members = bridge_client
+                    .get_bridge_summary()
+                    .await
+                    .map_err(|e| anyhow!("{e:?}"))?
+                    .committee
+                    .members;
+                if !committee_members
+                    .into_iter()
+                    .any(|(_, m)| m.sui_address == address)
+                {
+                    bail!("Address {} is not in the committee", address);
+                }
+                println!(
+                    "Updating bridge committee node URL for Sui validator: {address}, url: {}",
+                    bridge_authority_url
+                );
+
+                let bridge = bridge_client
+                    .get_mutable_bridge_object_arg_must_succeed()
+                    .await;
+
+                let gas_budget = gas_budget.unwrap_or(DEFAULT_GAS_BUDGET);
+                let (_, gas) = context
+                    .gas_for_owner_budget(address, gas_budget, Default::default())
+                    .await?;
+
+                let gas_price = context.get_reference_gas_price().await?;
+                let tx_data = build_committee_update_url_transaction(
+                    address,
+                    &gas.object_ref(),
+                    bridge,
+                    &bridge_authority_url,
+                    gas_price,
+                    gas_budget,
+                )
+                .map_err(|e| anyhow!("{e:?}"))?;
+                if print_unsigned_transaction_only {
+                    let serialized_data = Base64::encode(bcs::to_bytes(&tx_data)?);
+                    SuiValidatorCommandResponse::UpdateBridgeCommitteeURL {
+                        execution_response: None,
+                        serialized_unsigned_transaction: Some(serialized_data),
+                    }
+                } else {
+                    let tx = context.sign_transaction(&tx_data);
+                    let response = context.execute_transaction_must_succeed(tx).await;
+                    println!(
+                        "Update Bridge validator node URL successful. Transaction digest: {}",
+                        response.digest
+                    );
+                    SuiValidatorCommandResponse::UpdateBridgeCommitteeURL {
+                        execution_response: Some(response),
+                        serialized_unsigned_transaction: None,
+                    }
+                }
+            }
         });
         ret
+    }
+}
+
+fn check_address(
+    active_address: SuiAddress,
+    validator_address: Option<SuiAddress>,
+    print_unsigned_transaction_only: bool,
+) -> Result<SuiAddress, anyhow::Error> {
+    if !print_unsigned_transaction_only {
+        if let Some(validator_address) = validator_address {
+            if validator_address != active_address {
+                bail!(
+                    "`--validator-address` must be the same as the current active address: {}",
+                    active_address
+                );
+            }
+        }
+        Ok(active_address)
+    } else {
+        validator_address
+            .ok_or_else(|| anyhow!("--validator-address must be provided when `print_unsigned_transaction_only` is true"))
     }
 }
 
@@ -546,15 +825,15 @@ async fn get_validator_summary_from_cap_id(
     Ok((status, summary))
 }
 
-async fn call_0x5(
+async fn construct_unsigned_0x5_txn(
     context: &mut WalletContext,
+    sender: SuiAddress,
     function: &'static str,
     call_args: Vec<CallArg>,
     gas_budget: u64,
-) -> anyhow::Result<SuiTransactionBlockResponse> {
-    let sender = context.active_address()?;
+) -> anyhow::Result<TransactionData> {
     let sui_client = context.get_client().await?;
-    let mut args = vec![SUI_SYSTEM_OBJ_CALL_ARG];
+    let mut args = vec![CallArg::SUI_SYSTEM_MUT];
     args.extend(call_args);
     let rgp = sui_client
         .governance_api()
@@ -562,7 +841,7 @@ async fn call_0x5(
         .await?;
 
     let gas_obj_ref = get_gas_obj_ref(sender, &sui_client, gas_budget).await?;
-    let tx_data = TransactionData::new_move_call(
+    TransactionData::new_move_call(
         sender,
         SUI_SYSTEM_PACKAGE_ID,
         ident_str!("sui_system").to_owned(),
@@ -573,22 +852,32 @@ async fn call_0x5(
         gas_budget,
         rgp,
     )
-    .unwrap();
+}
+
+async fn call_0x5(
+    context: &mut WalletContext,
+    function: &'static str,
+    call_args: Vec<CallArg>,
+    gas_budget: u64,
+) -> anyhow::Result<SuiTransactionBlockResponse> {
+    let sender = context.active_address()?;
+    let tx_data =
+        construct_unsigned_0x5_txn(context, sender, function, call_args, gas_budget).await?;
     let signature =
         context
             .config
             .keystore
             .sign_secure(&sender, &tx_data, Intent::sui_transaction())?;
-    let transaction =
-        Transaction::from_data(tx_data, Intent::sui_transaction(), vec![signature]).verify()?;
+    let transaction = Transaction::from_data(tx_data, vec![signature]);
+    let sui_client = context.get_client().await?;
     sui_client
-        .quorum_driver()
+        .quorum_driver_api()
         .execute_transaction_block(
             transaction,
             SuiTransactionBlockResponseOptions::new()
                 .with_input()
                 .with_effects(),
-            Some(sui_types::messages::ExecuteTransactionRequestType::WaitForLocalExecution),
+            Some(sui_types::quorum_driver_types::ExecuteTransactionRequestType::WaitForLocalExecution),
         )
         .await
         .map_err(|err| anyhow::anyhow!(err.to_string()))
@@ -620,6 +909,34 @@ impl Display for SuiValidatorCommandResponse {
             }
             SuiValidatorCommandResponse::SerializedPayload(response) => {
                 write!(writer, "Serialized payload: {}", response)?;
+            }
+            SuiValidatorCommandResponse::DisplayGasPriceUpdateRawTxn {
+                data,
+                serialized_data,
+            } => {
+                write!(
+                    writer,
+                    "Transaction: {:?}, \nSerialized transaction: {:?}",
+                    data, serialized_data
+                )?;
+            }
+            SuiValidatorCommandResponse::RegisterBridgeCommittee {
+                execution_response,
+                serialized_unsigned_transaction,
+            }
+            | SuiValidatorCommandResponse::UpdateBridgeCommitteeURL {
+                execution_response,
+                serialized_unsigned_transaction,
+            } => {
+                if let Some(response) = execution_response {
+                    write!(writer, "{}", write_transaction_response(response)?)?;
+                } else {
+                    write!(
+                        writer,
+                        "Serialized transaction for signing: {:?}",
+                        serialized_unsigned_transaction
+                    )?;
+                }
             }
         }
         write!(f, "{}", writer.trim_end_matches('\n'))
@@ -685,7 +1002,7 @@ pub enum ValidatorStatus {
     Pending,
 }
 
-async fn get_validator_summary(
+pub async fn get_validator_summary(
     client: &SuiClient,
     validator_address: SuiAddress,
 ) -> anyhow::Result<Option<(ValidatorStatus, SuiValidatorSummary)>> {
@@ -853,6 +1170,10 @@ async fn update_metadata(
             call_0x5(context, "update_validator_project_url", args, gas_budget).await
         }
         MetadataUpdate::NetworkAddress { network_address } => {
+            // Check the network address to be in TCP.
+            if !network_address.is_loosely_valid_tcp_addr() {
+                bail!("Network address must be a TCP address");
+            }
             let _status = check_status(context, HashSet::from([Pending, Active])).await?;
             let args = vec![CallArg::Pure(bcs::to_bytes(&network_address).unwrap())];
             call_0x5(
@@ -864,6 +1185,9 @@ async fn update_metadata(
             .await
         }
         MetadataUpdate::PrimaryAddress { primary_address } => {
+            primary_address.to_anemo_address().map_err(|_| {
+                anyhow!("Invalid primary address, it must look like `/[ip4,ip6,dns]/.../udp/port`")
+            })?;
             let _status = check_status(context, HashSet::from([Pending, Active])).await?;
             let args = vec![CallArg::Pure(bcs::to_bytes(&primary_address).unwrap())];
             call_0x5(
@@ -875,6 +1199,9 @@ async fn update_metadata(
             .await
         }
         MetadataUpdate::WorkerAddress { worker_address } => {
+            worker_address.to_anemo_address().map_err(|_| {
+                anyhow!("Invalid worker address, it must look like `/[ip4,ip6,dns]/.../udp/port`")
+            })?;
             // Only an active validator can leave committee.
             let _status = check_status(context, HashSet::from([Pending, Active])).await?;
             let args = vec![CallArg::Pure(bcs::to_bytes(&worker_address).unwrap())];
@@ -887,6 +1214,9 @@ async fn update_metadata(
             .await
         }
         MetadataUpdate::P2pAddress { p2p_address } => {
+            p2p_address.to_anemo_address().map_err(|_| {
+                anyhow!("Invalid p2p address, it must look like `/[ip4,ip6,dns]/.../udp/port`")
+            })?;
             let _status = check_status(context, HashSet::from([Pending, Active])).await?;
             let args = vec![CallArg::Pure(bcs::to_bytes(&p2p_address).unwrap())];
             call_0x5(

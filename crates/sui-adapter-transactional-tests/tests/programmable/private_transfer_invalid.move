@@ -7,17 +7,14 @@
 
 //# publish
 module test::m1 {
-    use sui::object::{Self, UID};
-    use sui::tx_context::TxContext;
-
-    struct Pub has key, store { id: UID }
+    public struct Pub has key, store { id: UID }
     public fun pub(ctx: &mut TxContext): Pub { Pub { id: object::new(ctx) } }
 
-    struct Priv has key { id: UID }
+    public struct Priv has key { id: UID }
     public fun priv(ctx: &mut TxContext): Priv { Priv { id: object::new(ctx) } }
 }
 
-// Has store, but cannot be used with internal varaints
+// Has store, but cannot be used with internal variants
 
 //# programmable --sender A --inputs @A
 //> 0: test::m1::pub();
@@ -32,7 +29,7 @@ module test::m1 {
 //> sui::transfer::freeze_object<test::m1::Pub>(Result(0));
 
 
-// Does not have store, cannot be used with internal varaints
+// Does not have store, cannot be used with internal variants
 
 //# programmable --sender A --inputs @A
 //> 0: test::m1::priv();
@@ -47,7 +44,7 @@ module test::m1 {
 //> sui::transfer::freeze_object<test::m1::Priv>(Result(0));
 
 
-// Does not have store, cannot be used with public varaints
+// Does not have store, cannot be used with public variants
 
 //# programmable --sender A --inputs @A
 //> 0: test::m1::priv();

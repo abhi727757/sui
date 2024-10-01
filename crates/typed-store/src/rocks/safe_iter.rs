@@ -3,37 +3,53 @@
 use std::{marker::PhantomData, sync::Arc};
 
 use bincode::Options;
+use prometheus::{Histogram, HistogramTimer};
 use rocksdb::Direction;
 
-use crate::metrics::{DBMetrics, SamplingInterval};
+use crate::metrics::{DBMetrics, RocksDBPerfContext};
 
-use super::{be_fix_int_ser, errors::TypedStoreError, RocksDBRawIter};
+use super::{be_fix_int_ser, RocksDBRawIter, TypedStoreError};
 use serde::{de::DeserializeOwned, Serialize};
 
 /// An iterator over all key-value pairs in a data map.
 pub struct SafeIter<'a, K, V> {
+    cf_name: String,
     db_iter: RocksDBRawIter<'a>,
     _phantom: PhantomData<(K, V)>,
     direction: Direction,
-    cf: String,
-    db_metrics: Arc<DBMetrics>,
-    iter_bytes_sample_interval: SamplingInterval,
+    is_initialized: bool,
+    _timer: Option<HistogramTimer>,
+    _perf_ctx: Option<RocksDBPerfContext>,
+    bytes_scanned: Option<Histogram>,
+    keys_scanned: Option<Histogram>,
+    db_metrics: Option<Arc<DBMetrics>>,
+    bytes_scanned_counter: usize,
+    keys_returned_counter: usize,
 }
 
 impl<'a, K: DeserializeOwned, V: DeserializeOwned> SafeIter<'a, K, V> {
     pub(super) fn new(
+        cf_name: String,
         db_iter: RocksDBRawIter<'a>,
-        cf: String,
-        db_metrics: &Arc<DBMetrics>,
-        iter_bytes_sample_interval: &SamplingInterval,
+        _timer: Option<HistogramTimer>,
+        _perf_ctx: Option<RocksDBPerfContext>,
+        bytes_scanned: Option<Histogram>,
+        keys_scanned: Option<Histogram>,
+        db_metrics: Option<Arc<DBMetrics>>,
     ) -> Self {
         Self {
+            cf_name,
             db_iter,
             _phantom: PhantomData,
             direction: Direction::Forward,
-            cf,
-            db_metrics: db_metrics.clone(),
-            iter_bytes_sample_interval: iter_bytes_sample_interval.clone(),
+            is_initialized: false,
+            _timer,
+            _perf_ctx,
+            bytes_scanned,
+            keys_scanned,
+            db_metrics,
+            bytes_scanned_counter: 0,
+            keys_returned_counter: 0,
         }
     }
 }
@@ -42,6 +58,12 @@ impl<'a, K: DeserializeOwned, V: DeserializeOwned> Iterator for SafeIter<'a, K, 
     type Item = Result<(K, V), TypedStoreError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Implicitly set iterator to the first entry in the column family if it hasn't been initialized
+        // used for backward compatibility
+        if !self.is_initialized {
+            self.db_iter.seek_to_first();
+            self.is_initialized = true;
+        }
         if self.db_iter.valid() {
             let config = bincode::DefaultOptions::new()
                 .with_big_endian()
@@ -54,21 +76,14 @@ impl<'a, K: DeserializeOwned, V: DeserializeOwned> Iterator for SafeIter<'a, K, 
                 .db_iter
                 .value()
                 .expect("Valid iterator failed to get value");
+            self.bytes_scanned_counter += raw_key.len() + raw_value.len();
+            self.keys_returned_counter += 1;
             let key = config.deserialize(raw_key).ok();
             let value = bcs::from_bytes(raw_value).ok();
-            if self.iter_bytes_sample_interval.sample() {
-                let total_bytes_read = (raw_key.len() + raw_value.len()) as f64;
-                self.db_metrics
-                    .op_metrics
-                    .rocksdb_iter_bytes
-                    .with_label_values(&[&self.cf])
-                    .observe(total_bytes_read);
-            }
             match self.direction {
                 Direction::Forward => self.db_iter.next(),
                 Direction::Reverse => self.db_iter.prev(),
             }
-
             key.and_then(|k| value.map(|v| Ok((k, v))))
         } else {
             match self.db_iter.status() {
@@ -79,12 +94,29 @@ impl<'a, K: DeserializeOwned, V: DeserializeOwned> Iterator for SafeIter<'a, K, 
     }
 }
 
+impl<'a, K, V> Drop for SafeIter<'a, K, V> {
+    fn drop(&mut self) {
+        if let Some(bytes_scanned) = self.bytes_scanned.take() {
+            bytes_scanned.observe(self.bytes_scanned_counter as f64);
+        }
+        if let Some(keys_scanned) = self.keys_scanned.take() {
+            keys_scanned.observe(self.keys_returned_counter as f64);
+        }
+        if let Some(db_metrics) = self.db_metrics.take() {
+            db_metrics
+                .read_perf_ctx_metrics
+                .report_metrics(&self.cf_name);
+        }
+    }
+}
+
 impl<'a, K: Serialize, V> SafeIter<'a, K, V> {
     /// Skips all the elements that are smaller than the given key,
     /// and either lands on the key or the first one greater than
     /// the key.
     pub fn skip_to(mut self, key: &K) -> Result<Self, TypedStoreError> {
         self.db_iter.seek(be_fix_int_ser(key)?);
+        self.is_initialized = true;
         Ok(self)
     }
 
@@ -93,12 +125,14 @@ impl<'a, K: Serialize, V> SafeIter<'a, K, V> {
     /// no element prior to it, it returns an empty iterator.
     pub fn skip_prior_to(mut self, key: &K) -> Result<Self, TypedStoreError> {
         self.db_iter.seek_for_prev(be_fix_int_ser(key)?);
+        self.is_initialized = true;
         Ok(self)
     }
 
     /// Seeks to the last key in the database (at this column family).
     pub fn skip_to_last(mut self) -> Self {
         self.db_iter.seek_to_last();
+        self.is_initialized = true;
         self
     }
 

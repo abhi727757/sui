@@ -5,7 +5,9 @@ use async_trait::async_trait;
 use embedded_reconfig_observer::EmbeddedReconfigObserver;
 use fullnode_reconfig_observer::FullNodeReconfigObserver;
 use futures::{stream::FuturesUnordered, StreamExt};
+use mysten_metrics::GaugeGuard;
 use prometheus::Registry;
+use rand::Rng;
 use roaring::RoaringBitmap;
 use std::{
     collections::BTreeMap,
@@ -15,9 +17,7 @@ use std::{
 use sui_config::genesis::Genesis;
 use sui_core::{
     authority_aggregator::{AuthorityAggregator, AuthorityAggregatorBuilder},
-    authority_client::{
-        make_authority_clients_with_timeout_config, AuthorityAPI, NetworkAuthorityClient,
-    },
+    authority_client::{AuthorityAPI, NetworkAuthorityClient},
     quorum_driver::{
         QuorumDriver, QuorumDriverHandler, QuorumDriverHandlerBuilder, QuorumDriverMetrics,
     },
@@ -26,14 +26,15 @@ use sui_json_rpc_types::{
     SuiObjectDataOptions, SuiObjectResponse, SuiObjectResponseQuery, SuiTransactionBlockEffects,
     SuiTransactionBlockEffectsAPI, SuiTransactionBlockResponseOptions,
 };
-use sui_network::{DEFAULT_CONNECT_TIMEOUT_SEC, DEFAULT_REQUEST_TIMEOUT_SEC};
 use sui_sdk::{SuiClient, SuiClientBuilder};
-use sui_types::messages::Argument;
-use sui_types::messages::CallArg;
-use sui_types::messages::ObjectArg;
-use sui_types::messages::TransactionEvents;
+use sui_types::base_types::ConciseableName;
+use sui_types::committee::CommitteeTrait;
+use sui_types::effects::{CertifiedTransactionEffects, TransactionEffectsAPI, TransactionEvents};
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
 use sui_types::sui_system_state::sui_system_state_summary::SuiSystemStateSummary;
+use sui_types::transaction::Argument;
+use sui_types::transaction::CallArg;
+use sui_types::transaction::ObjectArg;
 use sui_types::{
     base_types::ObjectID,
     committee::{Committee, EpochId},
@@ -42,11 +43,8 @@ use sui_types::{
         AuthoritySignature,
     },
     message_envelope::Envelope,
-    messages::{
-        CertifiedTransaction, CertifiedTransactionEffects, HandleCertificateResponse,
-        QuorumDriverResponse, Transaction, TransactionEffectsAPI, TransactionStatus,
-    },
     object::Object,
+    transaction::{CertifiedTransaction, Transaction},
 };
 use sui_types::{base_types::ObjectRef, crypto::AuthorityStrongQuorumSignInfo, object::Owner};
 use sui_types::{base_types::SequenceNumber, gas_coin::GasCoin};
@@ -55,7 +53,10 @@ use sui_types::{
     sui_system_state::SuiSystemStateTrait,
 };
 use sui_types::{error::SuiError, gas::GasCostSummary};
-use tokio::{task::JoinSet, time::timeout};
+use tokio::{
+    task::JoinSet,
+    time::{sleep, timeout},
+};
 use tracing::{error, info};
 
 pub mod bank;
@@ -69,6 +70,8 @@ pub mod system_state_observer;
 pub mod util;
 pub mod workloads;
 use futures::FutureExt;
+use sui_types::messages_grpc::{HandleCertificateResponseV2, TransactionStatus};
+use sui_types::quorum_driver_types::{QuorumDriverError, QuorumDriverResponse};
 
 #[derive(Debug)]
 /// A wrapper on execution results to accommodate different types of
@@ -96,7 +99,7 @@ impl ExecutionEffects {
     pub fn created(&self) -> Vec<(ObjectRef, Owner)> {
         match self {
             ExecutionEffects::CertifiedTransactionEffects(certified_effects, ..) => {
-                certified_effects.data().created().to_vec()
+                certified_effects.data().created()
             }
             ExecutionEffects::SuiTransactionBlockEffects(sui_tx_effects) => sui_tx_effects
                 .created()
@@ -131,7 +134,7 @@ impl ExecutionEffects {
     pub fn gas_object(&self) -> (ObjectRef, Owner) {
         match self {
             ExecutionEffects::CertifiedTransactionEffects(certified_effects, ..) => {
-                *certified_effects.data().gas_object()
+                certified_effects.data().gas_object()
             }
             ExecutionEffects::SuiTransactionBlockEffects(sui_tx_effects) => {
                 let refe = &sui_tx_effects.gas_object();
@@ -225,7 +228,7 @@ pub trait ValidatorProxy {
     /// signature. It should only be used for benchmarks.
     async fn execute_bench_transaction(&self, tx: Transaction) -> anyhow::Result<ExecutionEffects>;
 
-    fn clone_committee(&self) -> Committee;
+    fn clone_committee(&self) -> Arc<Committee>;
 
     fn get_current_epoch(&self) -> EpochId;
 
@@ -250,25 +253,17 @@ impl LocalValidatorAggregatorProxy {
         registry: &Registry,
         reconfig_fullnode_rpc_url: Option<&str>,
     ) -> Self {
-        let (aggregator, _) = AuthorityAggregatorBuilder::from_genesis(genesis)
+        let (aggregator, clients) = AuthorityAggregatorBuilder::from_genesis(genesis)
             .with_registry(registry)
-            .build()
-            .unwrap();
-
-        let committee = genesis.committee_with_network();
-        let clients = make_authority_clients_with_timeout_config(
-            &committee,
-            DEFAULT_CONNECT_TIMEOUT_SEC,
-            DEFAULT_REQUEST_TIMEOUT_SEC,
-        )
-        .unwrap();
+            .build_network_clients();
+        let committee = genesis.committee().unwrap();
 
         Self::new_impl(
             aggregator,
             registry,
             reconfig_fullnode_rpc_url,
             clients,
-            committee.committee,
+            committee,
         )
         .await
     }
@@ -355,28 +350,47 @@ impl ValidatorProxy for LocalValidatorAggregatorProxy {
             return self.execute_bench_transaction(tx).await;
         }
         let tx_digest = *tx.digest();
-        let tx = tx.verify()?;
         let mut retry_cnt = 0;
         while retry_cnt < 3 {
-            let ticket = self.qd.submit_transaction(tx.clone()).await?;
+            let ticket = self
+                .qd
+                .submit_transaction(
+                    sui_types::quorum_driver_types::ExecuteTransactionRequestV3 {
+                        transaction: tx.clone(),
+                        include_events: true,
+                        include_input_objects: false,
+                        include_output_objects: false,
+                        include_auxiliary_data: false,
+                    },
+                )
+                .await?;
             // The ticket only times out when QuorumDriver exceeds the retry times
             match ticket.await {
                 Ok(resp) => {
                     let QuorumDriverResponse {
                         effects_cert,
                         events,
+                        ..
                     } = resp;
                     return Ok(ExecutionEffects::CertifiedTransactionEffects(
                         effects_cert.into(),
-                        events,
+                        events.unwrap_or_default(),
                     ));
                 }
+                Err(QuorumDriverError::NonRecoverableTransactionError { errors }) => {
+                    bail!(QuorumDriverError::NonRecoverableTransactionError { errors });
+                }
                 Err(err) => {
+                    let delay = Duration::from_millis(rand::thread_rng().gen_range(100..1000));
                     error!(
                         ?tx_digest,
-                        retry_cnt, "Transaction failed with err: {:?}", err
+                        retry_cnt,
+                        "Transaction failed with err: {:?}. Sleeping for {:?} ...",
+                        err,
+                        delay,
                     );
                     retry_cnt += 1;
+                    sleep(delay).await;
                 }
             }
         }
@@ -386,13 +400,21 @@ impl ValidatorProxy for LocalValidatorAggregatorProxy {
     async fn execute_bench_transaction(&self, tx: Transaction) -> anyhow::Result<ExecutionEffects> {
         // Store the epoch number; we read it from the votes and use it later to create the certificate.
         let mut epoch = 0;
+        let auth_agg = self.qd.authority_aggregator().load();
 
         // Send the transaction to all validators.
+        let tx_guard = GaugeGuard::acquire(&auth_agg.metrics.inflight_transactions);
         let mut futures = FuturesUnordered::new();
         for (name, client) in self.clients.iter() {
-            let fut = client.handle_transaction(tx.clone()).map(|r| (r, *name));
+            let fut = client
+                .handle_transaction(tx.clone(), None)
+                .map(|r| (r, *name));
             futures.push(fut);
         }
+        auth_agg
+            .metrics
+            .inflight_transaction_requests
+            .add(futures.len() as i64);
 
         // TODO: This following aggregation will not work well at epoch boundary.
 
@@ -401,6 +423,7 @@ impl ValidatorProxy for LocalValidatorAggregatorProxy {
         let mut votes = Vec::new();
         let mut certificate = None;
         while let Some((response, name)) = futures.next().await {
+            auth_agg.metrics.inflight_transaction_requests.dec();
             match response {
                 Ok(response) => match response.status {
                     // If all goes well, the authority returns a vote.
@@ -481,8 +504,14 @@ impl ValidatorProxy for LocalValidatorAggregatorProxy {
                 Envelope::new_from_data_and_sig(tx.into_data(), quorum_signature)
             }
         };
+        auth_agg
+            .metrics
+            .inflight_transaction_requests
+            .sub(futures.len() as i64);
+        drop(tx_guard);
 
         // Send the certificate to all validators.
+        let _cert_guard = GaugeGuard::acquire(&auth_agg.metrics.inflight_certificates);
         let mut futures = FuturesUnordered::new();
         total_stake = 0;
         let mut transaction_effects = None;
@@ -493,19 +522,25 @@ impl ValidatorProxy for LocalValidatorAggregatorProxy {
             let name = *name;
             futures.push(async move {
                 client
-                    .handle_certificate(certificate)
+                    .handle_certificate_v2(certificate, None)
                     .map(move |r| (r, name))
                     .await
             });
         }
+        auth_agg
+            .metrics
+            .inflight_certificate_requests
+            .add(futures.len() as i64);
 
         // Wait for the replies from a quorum of validators.
         while let Some((response, name)) = futures.next().await {
+            auth_agg.metrics.inflight_certificate_requests.dec();
             match response {
                 // If all goes well, the validators reply with signed effects.
-                Ok(HandleCertificateResponse {
+                Ok(HandleCertificateResponseV2 {
                     signed_effects,
                     events,
+                    fastpath_input_objects: _, // unused field
                 }) => {
                     let author = signed_effects.auth_sig().authority;
                     transaction_effects = Some(signed_effects.data().clone());
@@ -516,9 +551,7 @@ impl ValidatorProxy for LocalValidatorAggregatorProxy {
                 // This typically happens when the validators are overloaded and the certificate is
                 // immediately rejected.
                 Err(e) => {
-                    self.qd
-                        .authority_aggregator()
-                        .load()
+                    auth_agg
                         .metrics
                         .process_cert_errors
                         .with_label_values(&[&name.concise().to_string(), e.as_ref()])
@@ -539,10 +572,21 @@ impl ValidatorProxy for LocalValidatorAggregatorProxy {
         }
 
         // Wait for 10 more seconds on remaining requests asynchronously.
+        const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
         {
+            let auth_agg = auth_agg.clone();
             let mut requests = self.requests.lock().unwrap();
             requests.spawn(async move {
-                let _ = timeout(Duration::from_secs(10), futures.collect::<Vec<_>>()).await;
+                let _ = timeout(WAIT_TIMEOUT, async {
+                    while futures.next().await.is_some() {
+                        auth_agg.metrics.inflight_certificate_requests.dec();
+                    }
+                })
+                .await;
+                auth_agg
+                    .metrics
+                    .inflight_certificate_requests
+                    .sub(futures.len() as i64);
             });
         }
 
@@ -555,7 +599,7 @@ impl ValidatorProxy for LocalValidatorAggregatorProxy {
         Ok(effects)
     }
 
-    fn clone_committee(&self) -> Committee {
+    fn clone_committee(&self) -> Arc<Committee> {
         self.qd.clone_committee()
     }
 
@@ -587,7 +631,7 @@ impl ValidatorProxy for LocalValidatorAggregatorProxy {
 
 pub struct FullNodeProxy {
     sui_client: SuiClient,
-    committee: Committee,
+    committee: Arc<Committee>,
 }
 
 impl FullNodeProxy {
@@ -601,14 +645,13 @@ impl FullNodeProxy {
         let resp = sui_client.read_api().get_committee_info(None).await?;
         let epoch = resp.epoch;
         let committee_vec = resp.validators;
-        let committee_map =
-            BTreeMap::from_iter(committee_vec.into_iter().map(|(name, stake)| (name, stake)));
+        let committee_map = BTreeMap::from_iter(committee_vec.into_iter());
         let committee =
             Committee::new_for_testing_with_normalized_voting_power(epoch, committee_map);
 
         Ok(Self {
             sui_client,
-            committee,
+            committee: Arc::new(committee),
         })
     }
 }
@@ -684,14 +727,13 @@ impl ValidatorProxy for FullNodeProxy {
 
     async fn execute_transaction_block(&self, tx: Transaction) -> anyhow::Result<ExecutionEffects> {
         let tx_digest = *tx.digest();
-        let tx = tx.verify()?;
         let mut retry_cnt = 0;
         while retry_cnt < 10 {
             // Fullnode could time out after WAIT_FOR_FINALITY_TIMEOUT (30s) in TransactionOrchestrator
             // SuiClient times out after 60s
             match self
                 .sui_client
-                .quorum_driver()
+                .quorum_driver_api()
                 .execute_transaction_block(
                     tx.clone(),
                     SuiTransactionBlockResponseOptions::new().with_effects(),
@@ -721,7 +763,7 @@ impl ValidatorProxy for FullNodeProxy {
         self.execute_transaction_block(tx).await
     }
 
-    fn clone_committee(&self) -> Committee {
+    fn clone_committee(&self) -> Arc<Committee> {
         self.committee.clone()
     }
 
@@ -822,6 +864,9 @@ impl From<CallArg> for BenchMoveCallArg {
                     initial_shared_version,
                     mutable,
                 } => BenchMoveCallArg::Shared((id, initial_shared_version, mutable)),
+                ObjectArg::Receiving(_) => {
+                    unimplemented!("Receiving is not supported for benchmarks")
+                }
             },
         }
     }

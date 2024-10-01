@@ -5,6 +5,7 @@ use super::{
     workload::{Workload, WorkloadBuilder, MAX_GAS_FOR_TESTING},
     WorkloadBuilderInfo, WorkloadParams,
 };
+use crate::drivers::Interval;
 use crate::in_memory_wallet::move_call_pt_impl;
 use crate::in_memory_wallet::InMemoryWallet;
 use crate::system_state_observer::{SystemState, SystemStateObserver};
@@ -14,7 +15,6 @@ use crate::ProgrammableTransactionBuilder;
 use crate::{convert_move_call_args, BenchMoveCallArg, ExecutionEffects, ValidatorProxy};
 use anyhow::anyhow;
 use async_trait::async_trait;
-use itertools::Itertools;
 use move_core_types::identifier::Identifier;
 use rand::distributions::{Distribution, Standard};
 use rand::Rng;
@@ -25,13 +25,14 @@ use std::sync::Arc;
 use strum::{EnumCount, IntoEnumIterator};
 use strum_macros::{EnumCount as EnumCountMacro, EnumIter};
 use sui_protocol_config::ProtocolConfig;
+use sui_test_transaction_builder::TestTransactionBuilder;
 use sui_types::base_types::{random_object_ref, ObjectRef};
-use sui_types::messages::Command;
-use sui_types::messages::{CallArg, ObjectArg, TransactionEffectsAPI};
+use sui_types::effects::TransactionEffectsAPI;
+use sui_types::transaction::Command;
+use sui_types::transaction::{CallArg, ObjectArg};
 use sui_types::{base_types::ObjectID, object::Owner};
-use sui_types::{base_types::SuiAddress, crypto::get_key_pair, messages::VerifiedTransaction};
-use sui_types::{messages::TransactionData, utils::to_sender_signed_transaction};
-use test_utils::messages::create_publish_move_package_transaction_with_budget;
+use sui_types::{base_types::SuiAddress, crypto::get_key_pair, transaction::Transaction};
+use sui_types::{transaction::TransactionData, utils::to_sender_signed_transaction};
 use tracing::debug;
 
 /// Number of vectors to create in LargeTransientRuntimeVectors workload
@@ -97,7 +98,7 @@ impl FromStr for AdversarialPayloadType {
 
 impl Distribution<AdversarialPayloadType> for Standard {
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> AdversarialPayloadType {
-        // Excluse the "Random" variant
+        // Exclude the "Random" variant
         let n = rng.gen_range(1..AdversarialPayloadType::COUNT);
         AdversarialPayloadType::iter().nth(n).unwrap()
     }
@@ -142,7 +143,7 @@ impl FromStr for AdversarialPayloadCfg {
         if !re.is_match(s) {
             return Err(anyhow!("invalid load config"));
         };
-        let toks = s.split('-').collect_vec();
+        let toks = s.split('-').collect::<Vec<_>>();
         let payload_type = AdversarialPayloadType::from_str(toks[0])?;
         let load_factor = toks[1].parse::<f32>().unwrap();
 
@@ -175,7 +176,7 @@ impl Payload for AdversarialTestPayload {
         self.state.update(effects);
     }
 
-    fn make_transaction(&mut self) -> VerifiedTransaction {
+    fn make_transaction(&mut self) -> Transaction {
         let payload_type = self.adversarial_payload_cfg.payload_type;
 
         self.create_transaction(
@@ -202,7 +203,7 @@ impl AdversarialTestPayload {
         &self,
         payload_type: &AdversarialPayloadType,
         protocol_config: &ProtocolConfig,
-    ) -> VerifiedTransaction {
+    ) -> Transaction {
         let args = self.get_payload_args(payload_type, protocol_config);
         let module_name = "adversarial";
         let account = self.state.account(&self.sender).unwrap();
@@ -240,15 +241,9 @@ impl AdversarialTestPayload {
             AdversarialPayloadType::MaxPackagePublish => {
                 let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
                 path.push("src/workloads/data/max_package");
-
-                create_publish_move_package_transaction_with_budget(
-                    account.gas,
-                    path,
-                    self.sender,
-                    account.key(),
-                    Some(gas_price),
-                    gas_budget,
-                )
+                TestTransactionBuilder::new(self.sender, account.gas, gas_price)
+                    .publish(path)
+                    .build_and_sign(account.key())
             }
             _ => self.state.move_call_pt(
                 self.sender,
@@ -410,6 +405,8 @@ impl AdversarialWorkloadBuilder {
         num_workers: u64,
         in_flight_ratio: u64,
         adversarial_payload_cfg: AdversarialPayloadCfg,
+        duration: Interval,
+        group: u32,
     ) -> Option<WorkloadBuilderInfo> {
         let target_qps = (workload_weight * target_qps as f32) as u64;
         let num_workers = (workload_weight * num_workers as f32).ceil() as u64;
@@ -421,6 +418,8 @@ impl AdversarialWorkloadBuilder {
                 target_qps,
                 num_workers,
                 max_ops,
+                duration,
+                group,
             };
             let workload_builder = Box::<dyn WorkloadBuilder<dyn Payload>>::from(Box::new(
                 AdversarialWorkloadBuilder {
@@ -466,18 +465,10 @@ impl Workload<dyn Payload> for AdversarialWorkload {
         } = system_state_observer.state.borrow().clone();
         let protocol_config = protocol_config.unwrap();
         let gas_budget = protocol_config.max_tx_gas();
-        let transaction = create_publish_move_package_transaction_with_budget(
-            gas.0,
-            path,
-            gas.1,
-            &gas.2,
-            Some(reference_gas_price),
-            gas_budget,
-        );
-        let effects = proxy
-            .execute_transaction_block(transaction.into())
-            .await
-            .unwrap();
+        let transaction = TestTransactionBuilder::new(gas.1, gas.0, reference_gas_price)
+            .publish(path)
+            .build_and_sign(gas.2.as_ref());
+        let effects = proxy.execute_transaction_block(transaction).await.unwrap();
         let created = effects.created();
         // should only create the package object, upgrade cap, dynamic field top level obj, and NUM_DYNAMIC_FIELDS df objects. otherwise, there are some object initializers running and we will need to disambiguate
         assert_eq!(
@@ -524,10 +515,7 @@ impl Workload<dyn Payload> for AdversarialWorkload {
             reference_gas_price,
         );
 
-        let effects = proxy
-            .execute_transaction_block(transaction.into())
-            .await
-            .unwrap();
+        let effects = proxy.execute_transaction_block(transaction).await.unwrap();
 
         let created = effects.created();
         assert_eq!(created.len() as u64, num_shared_objs);

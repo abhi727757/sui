@@ -30,6 +30,8 @@ pub struct Authority {
     primary_address: Multiaddr,
     /// Network key of the primary.
     network_key: NetworkPublicKey,
+    /// The validator's hostname
+    hostname: String,
     /// There are secondary indexes that should be initialised before we are ready to use the
     /// authority - this bool protect us for premature use.
     #[serde(skip)]
@@ -46,6 +48,7 @@ impl Authority {
         stake: Stake,
         primary_address: Multiaddr,
         network_key: NetworkPublicKey,
+        hostname: String,
     ) -> Self {
         let protocol_key_bytes = PublicKeyBytes::from(&protocol_key);
 
@@ -56,6 +59,7 @@ impl Authority {
             stake,
             primary_address,
             network_key,
+            hostname,
             initialised: false,
         }
     }
@@ -93,6 +97,11 @@ impl Authority {
     pub fn network_key(&self) -> NetworkPublicKey {
         assert!(self.initialised);
         self.network_key.clone()
+    }
+
+    pub fn hostname(&self) -> &str {
+        assert!(self.initialised);
+        self.hostname.as_str()
     }
 }
 
@@ -138,6 +147,8 @@ impl Display for AuthorityIdentifier {
 }
 
 impl Committee {
+    pub const DEFAULT_FILENAME: &'static str = "committee.json";
+
     /// Any committee should be created via the CommitteeBuilder - this is intentionally be marked as
     /// private method.
     fn new(authorities: BTreeMap<PublicKey, Authority>, epoch: Epoch) -> Self {
@@ -293,8 +304,8 @@ impl Committee {
         let mut rng = StdRng::from_seed(seed_bytes);
         let choices = self
             .authorities
-            .iter()
-            .map(|(_name, authority)| (authority.clone(), authority.stake as f32))
+            .values()
+            .map(|authority| (authority.clone(), authority.stake as f32))
             .collect::<Vec<_>>();
         choices
             .choose_weighted(&mut rng, |item| item.1)
@@ -381,6 +392,7 @@ impl Committee {
     /// Update the networking information of some of the primaries. The arguments are a full vector of
     /// authorities which Public key and Stake must match the one stored in the current Committee. Any discrepancy
     /// will generate no update and return a vector of errors.
+    #[allow(clippy::manual_try_fold)]
     pub fn update_primary_network_info(
         &mut self,
         mut new_info: BTreeMap<PublicKey, (Stake, Multiaddr)>,
@@ -472,14 +484,41 @@ impl CommitteeBuilder {
         stake: Stake,
         primary_address: Multiaddr,
         network_key: NetworkPublicKey,
+        hostname: String,
     ) -> Self {
-        let authority = Authority::new(protocol_key.clone(), stake, primary_address, network_key);
+        let authority = Authority::new(
+            protocol_key.clone(),
+            stake,
+            primary_address,
+            network_key,
+            hostname,
+        );
         self.authorities.insert(protocol_key, authority);
         self
     }
 
     pub fn build(self) -> Committee {
         Committee::new(self.authorities, self.epoch)
+    }
+}
+
+impl std::fmt::Display for Committee {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Committee E{}: {:?}",
+            self.epoch(),
+            self.authorities
+                .keys()
+                .map(|x| {
+                    if let Some(k) = x.encode_base64().get(0..16) {
+                        k.to_owned()
+                    } else {
+                        format!("Invalid key: {}", x)
+                    }
+                })
+                .collect::<Vec<_>>()
+        )
     }
 }
 
@@ -499,8 +538,7 @@ mod tests {
         let num_of_authorities = 10;
 
         let authorities = (0..num_of_authorities)
-            .into_iter()
-            .map(|_i| {
+            .map(|i| {
                 let keypair = KeyPair::generate(&mut rng);
                 let network_keypair = NetworkKeyPair::generate(&mut rng);
 
@@ -509,6 +547,7 @@ mod tests {
                     1,
                     Multiaddr::empty(),
                     network_keypair.public().clone(),
+                    i.to_string(),
                 );
 
                 (keypair.public().clone(), a)
@@ -539,25 +578,5 @@ mod tests {
             assert_eq!(*id, authority_2.id());
             assert_eq!(&public_key, authority_1.protocol_key());
         }
-    }
-}
-
-impl std::fmt::Display for Committee {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Committee E{}: {:?}",
-            self.epoch(),
-            self.authorities
-                .keys()
-                .map(|x| {
-                    if let Some(k) = x.encode_base64().get(0..16) {
-                        k.to_owned()
-                    } else {
-                        format!("Invalid key: {}", x)
-                    }
-                })
-                .collect::<Vec<_>>()
-        )
     }
 }

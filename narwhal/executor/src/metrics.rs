@@ -1,8 +1,9 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 use prometheus::{
-    default_registry, register_histogram_with_registry, register_int_counter_with_registry,
-    register_int_gauge_with_registry, Histogram, IntCounter, IntGauge, Registry,
+    default_registry, register_histogram_vec_with_registry, register_histogram_with_registry,
+    register_int_counter_with_registry, register_int_gauge_with_registry, Histogram, HistogramVec,
+    IntCounter, IntGauge, Registry,
 };
 
 // buckets defined in seconds
@@ -34,11 +35,16 @@ pub struct ExecutorMetrics {
     /// Latency between the time when the batch has been
     /// created and when it has been fetched for execution
     pub batch_execution_latency: Histogram,
+    /// This is similar to batch_execution_latency but without the latency of
+    /// fetching batches from remote workers.
+    pub batch_execution_local_latency: HistogramVec,
     /// The number of batches per committed subdag to be fetched
     pub committed_subdag_batch_count: Histogram,
     /// Latency for time taken to fetch all batches for committed subdag
     /// either from local or remote worker.
     pub batch_fetch_for_committed_subdag_total_latency: Histogram,
+    /// Number of transactions in the consensus output.
+    pub consensus_output_transactions: IntCounter,
 }
 
 impl ExecutorMetrics {
@@ -89,10 +95,22 @@ impl ExecutorMetrics {
                 LATENCY_SEC_BUCKETS.to_vec(),
                 registry
             ).unwrap(),
+            batch_execution_local_latency: register_histogram_vec_with_registry!(
+                "batch_execution_local_latency",
+                "This is similar to batch_execution_latency but without the latency of fetching batches from remote workers.",
+                &["source"],
+                LATENCY_SEC_BUCKETS.to_vec(),
+                registry
+            ).unwrap(),
             subscriber_certificate_latency: register_histogram_with_registry!(
                 "subscriber_certificate_latency",
                 "Latency between when the certificate has been created and when it reached the executor",
                 LATENCY_SEC_BUCKETS.to_vec(),
+                registry
+            ).unwrap(),
+            consensus_output_transactions: register_int_counter_with_registry!(
+                "consensus_output_transactions",
+                "Number of transactions in consensus output",
                 registry
             ).unwrap(),
         }

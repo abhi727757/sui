@@ -73,19 +73,20 @@ impl SuiSystemStateWrapper {
         }
     }
 
-    pub fn advance_epoch_safe_mode<S>(
+    /// Advances epoch in safe mode natively in Rust, without involking Move.
+    /// This ensures that there cannot be any failure from Move and is guaranteed to succeed.
+    /// Returns the old and new inner system state object.
+    pub fn advance_epoch_safe_mode(
         &self,
         params: &AdvanceEpochParams,
-        object_store: &S,
+        object_store: &dyn ObjectStore,
         protocol_config: &ProtocolConfig,
-    ) -> Object
-    where
-        S: ObjectStore,
-    {
+    ) -> (Object, Object) {
         let id = self.id.id.bytes;
-        let mut field_object = get_dynamic_field_object_from_store(object_store, id, &self.version)
+        let old_field_object = get_dynamic_field_object_from_store(object_store, id, &self.version)
             .expect("Dynamic field object of wrapper should always be present in the object store");
-        let move_object = field_object
+        let mut new_field_object = old_field_object.clone();
+        let move_object = new_field_object
             .data
             .try_as_move_mut()
             .expect("Dynamic field object must be a Move object");
@@ -130,7 +131,7 @@ impl SuiSystemStateWrapper {
             }
             _ => unreachable!(),
         }
-        field_object
+        (old_field_object, new_field_object)
     }
 
     fn advance_epoch_safe_mode_impl<T>(
@@ -174,6 +175,10 @@ pub trait SuiSystemStateTrait {
     fn safe_mode(&self) -> bool;
     fn advance_epoch_safe_mode(&mut self, params: &AdvanceEpochParams);
     fn get_current_epoch_committee(&self) -> CommitteeWithNetworkMetadata;
+    fn get_pending_active_validators<S: ObjectStore + ?Sized>(
+        &self,
+        object_store: &S,
+    ) -> Result<Vec<SuiValidatorSummary>, SuiError>;
     fn into_epoch_start_state(self) -> EpochStartSystemState;
     fn into_sui_system_state_summary(self) -> SuiSystemStateSummary;
 }
@@ -216,10 +221,9 @@ impl SuiSystemState {
     }
 }
 
-pub fn get_sui_system_state_wrapper<S>(object_store: &S) -> Result<SuiSystemStateWrapper, SuiError>
-where
-    S: ObjectStore,
-{
+pub fn get_sui_system_state_wrapper(
+    object_store: &dyn ObjectStore,
+) -> Result<SuiSystemStateWrapper, SuiError> {
     let wrapper = object_store
         .get_object(&SUI_SYSTEM_STATE_OBJECT_ID)?
         // Don't panic here on None because object_store is a generic store.
@@ -236,10 +240,7 @@ where
     Ok(result)
 }
 
-pub fn get_sui_system_state<S>(object_store: &S) -> Result<SuiSystemState, SuiError>
-where
-    S: ObjectStore,
-{
+pub fn get_sui_system_state(object_store: &dyn ObjectStore) -> Result<SuiSystemState, SuiError> {
     let wrapper = get_sui_system_state_wrapper(object_store)?;
     let id = wrapper.id.id.bytes;
     match wrapper.version {
@@ -317,13 +318,12 @@ where
 /// dynamic field as a Validator type. We need the version to determine which inner type to use for
 /// the Validator type. This is assuming that the validator is stored in the table as
 /// ValidatorWrapper type.
-pub fn get_validator_from_table<S, K>(
-    object_store: &S,
+pub fn get_validator_from_table<K>(
+    object_store: &dyn ObjectStore,
     table_id: ObjectID,
     key: &K,
 ) -> Result<SuiValidatorSummary, SuiError>
 where
-    S: ObjectStore,
     K: MoveTypeTagTrait + Serialize + DeserializeOwned + fmt::Debug,
 {
     let field: ValidatorWrapper = get_dynamic_field_from_store(object_store, table_id, key)
@@ -378,6 +378,29 @@ where
     }
 }
 
+pub fn get_validators_from_table_vec<S, ValidatorType>(
+    object_store: &S,
+    table_id: ObjectID,
+    table_size: u64,
+) -> Result<Vec<ValidatorType>, SuiError>
+where
+    S: ObjectStore + ?Sized,
+    ValidatorType: Serialize + DeserializeOwned,
+{
+    let mut validators = vec![];
+    for i in 0..table_size {
+        let validator: ValidatorType = get_dynamic_field_from_store(&object_store, table_id, &i)
+            .map_err(|err| {
+                SuiError::SuiSystemStateReadError(format!(
+                    "Failed to load validator from table: {:?}",
+                    err
+                ))
+            })?;
+        validators.push(validator);
+    }
+    Ok(validators)
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq, Default)]
 pub struct PoolTokenExchangeRate {
     sui_amount: u64,
@@ -411,4 +434,40 @@ pub struct AdvanceEpochParams {
     pub storage_fund_reinvest_rate: u64,
     pub reward_slashing_rate: u64,
     pub epoch_start_timestamp_ms: u64,
+}
+
+#[cfg(msim)]
+pub mod advance_epoch_result_injection {
+    use crate::{
+        committee::EpochId,
+        error::{ExecutionError, ExecutionErrorKind},
+    };
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// Override the result of advance_epoch in the range [start, end).
+        static OVERRIDE: RefCell<Option<(EpochId, EpochId)>>  = RefCell::new(None);
+    }
+
+    /// Override the result of advance_epoch transaction if new epoch is in the provided range [start, end).
+    pub fn set_override(value: Option<(EpochId, EpochId)>) {
+        OVERRIDE.with(|o| *o.borrow_mut() = value);
+    }
+
+    /// This function is used to modify the result of advance_epoch transaction for testing.
+    /// If the override is set, the result will be an execution error, otherwise the original result will be returned.
+    pub fn maybe_modify_result(
+        result: Result<(), ExecutionError>,
+        current_epoch: EpochId,
+    ) -> Result<(), ExecutionError> {
+        if let Some((start, end)) = OVERRIDE.with(|o| *o.borrow()) {
+            if current_epoch >= start && current_epoch < end {
+                return Err::<(), ExecutionError>(ExecutionError::new(
+                    ExecutionErrorKind::FunctionNotFound,
+                    None,
+                ));
+            }
+        }
+        result
+    }
 }

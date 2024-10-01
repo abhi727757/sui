@@ -2,21 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::base_types::AuthorityName;
-use crate::certificate_proof::CertificateProof;
 use crate::committee::{Committee, EpochId};
 use crate::crypto::{
-    AuthorityQuorumSignInfo, AuthoritySignInfo, AuthoritySignInfoTrait, AuthoritySignature,
-    AuthorityStrongQuorumSignInfo, EmptySignInfo, Signer,
+    AuthorityKeyPair, AuthorityQuorumSignInfo, AuthoritySignInfo, AuthoritySignInfoTrait,
+    AuthoritySignature, AuthorityStrongQuorumSignInfo, EmptySignInfo, Signer,
 };
 use crate::error::SuiResult;
-use crate::messages::VersionedProtocolMessage;
+use crate::executable_transaction::CertificateProof;
 use crate::messages_checkpoint::CheckpointSequenceNumber;
+use crate::messages_consensus::{AuthorityIndex, Round, TransactionIndex};
+use crate::transaction::SenderSignedData;
+use fastcrypto::traits::KeyPair;
 use once_cell::sync::OnceCell;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_name::{DeserializeNameAdapter, SerializeNameAdapter};
 use shared_crypto::intent::{Intent, IntentScope};
 use std::fmt::{Debug, Display, Formatter};
 use std::ops::{Deref, DerefMut};
-use sui_protocol_config::ProtocolConfig;
 
 pub trait Message {
     type DigestType: Clone + Debug;
@@ -27,20 +29,48 @@ pub trait Message {
     }
 
     fn digest(&self) -> Self::DigestType;
-
-    /// Verify the internal data consistency of this message.
-    /// In some cases, such as user signed transaction, we also need
-    /// to verify the user signature here.
-    fn verify(&self, signature_epoch: Option<EpochId>) -> SuiResult;
 }
 
 #[derive(Clone, Debug, Eq, Serialize, Deserialize)]
+#[serde(remote = "Envelope")]
 pub struct Envelope<T: Message, S> {
     #[serde(skip)]
     digest: OnceCell<T::DigestType>,
 
     data: T,
     auth_signature: S,
+}
+
+impl<'de, T, S> Deserialize<'de> for Envelope<T, S>
+where
+    T: Message + Deserialize<'de>,
+    S: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        Envelope::deserialize(DeserializeNameAdapter::new(
+            deserializer,
+            std::any::type_name::<Self>(),
+        ))
+    }
+}
+
+impl<T, Sig> Serialize for Envelope<T, Sig>
+where
+    T: Message + Serialize,
+    Sig: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        Envelope::serialize(
+            self,
+            SerializeNameAdapter::new(serializer, std::any::type_name::<Self>()),
+        )
+    }
 }
 
 impl<T: Message, S> Envelope<T, S> {
@@ -95,12 +125,6 @@ impl<T: Message, S> Envelope<T, S> {
     }
 }
 
-impl<T: Message + VersionedProtocolMessage, S> VersionedProtocolMessage for Envelope<T, S> {
-    fn check_version_supported(&self, protocol_config: &ProtocolConfig) -> SuiResult {
-        self.data.check_version_supported(protocol_config)
-    }
-}
-
 impl<T: Message + PartialEq, S: PartialEq> PartialEq for Envelope<T, S> {
     fn eq(&self, other: &Self) -> bool {
         self.data == other.data && self.auth_signature == other.auth_signature
@@ -114,17 +138,6 @@ impl<T: Message> Envelope<T, EmptySignInfo> {
             data,
             auth_signature: EmptySignInfo {},
         }
-    }
-
-    pub fn verify_signature(&self) -> SuiResult {
-        self.data.verify(None)
-    }
-
-    pub fn verify(self) -> SuiResult<VerifiedEnvelope<T, EmptySignInfo>> {
-        self.verify_signature()?;
-        Ok(VerifiedEnvelope::<T, EmptySignInfo>::new_from_verified(
-            self,
-        ))
     }
 }
 
@@ -158,21 +171,15 @@ where
     pub fn epoch(&self) -> EpochId {
         self.auth_signature.epoch
     }
+}
 
-    pub fn verify_signature(&self, committee: &Committee) -> SuiResult {
-        self.data.verify(Some(self.auth_sig().epoch))?;
-        self.auth_signature
-            .verify_secure(self.data(), Intent::sui_app(T::SCOPE), committee)
-    }
-
-    pub fn verify(
-        self,
-        committee: &Committee,
-    ) -> SuiResult<VerifiedEnvelope<T, AuthoritySignInfo>> {
-        self.verify_signature(committee)?;
-        Ok(VerifiedEnvelope::<T, AuthoritySignInfo>::new_from_verified(
-            self,
-        ))
+impl Envelope<SenderSignedData, AuthoritySignInfo> {
+    pub fn verify_committee_sigs_only(&self, committee: &Committee) -> SuiResult {
+        self.auth_signature.verify_secure(
+            self.data(),
+            Intent::sui_app(IntentScope::SenderSignedTransaction),
+            committee,
+        )
     }
 }
 
@@ -196,24 +203,28 @@ where
         Ok(cert)
     }
 
+    pub fn new_from_keypairs_for_testing(
+        data: T,
+        keypairs: &[AuthorityKeyPair],
+        committee: &Committee,
+    ) -> Self {
+        let signatures = keypairs
+            .iter()
+            .map(|keypair| {
+                AuthoritySignInfo::new(
+                    committee.epoch(),
+                    &data,
+                    Intent::sui_app(T::SCOPE),
+                    keypair.public().into(),
+                    keypair,
+                )
+            })
+            .collect();
+        Self::new(data, signatures, committee).unwrap()
+    }
+
     pub fn epoch(&self) -> EpochId {
         self.auth_signature.epoch
-    }
-
-    // TODO: Eventually we should remove all calls to verify_signature
-    // and make sure they all call verify to avoid repeated verifications.
-    pub fn verify_signature(&self, committee: &Committee) -> SuiResult {
-        self.data.verify(Some(self.auth_sig().epoch))?;
-        self.auth_signature
-            .verify_secure(self.data(), Intent::sui_app(T::SCOPE), committee)
-    }
-
-    pub fn verify(
-        self,
-        committee: &Committee,
-    ) -> SuiResult<VerifiedEnvelope<T, AuthorityQuorumSignInfo<S>>> {
-        self.verify_signature(committee)?;
-        Ok(VerifiedEnvelope::<T, AuthorityQuorumSignInfo<S>>::new_from_verified(self))
     }
 }
 
@@ -312,12 +323,6 @@ impl<T: Message, S> VerifiedEnvelope<T, S> {
     /// Remove the authority signatures `S` from this envelope.
     pub fn into_unsigned(self) -> VerifiedEnvelope<T, EmptySignInfo> {
         VerifiedEnvelope::<T, EmptySignInfo>::new_from_verified(self.into_inner().into_unsigned())
-    }
-}
-
-impl<T: Message + VersionedProtocolMessage, S> VersionedProtocolMessage for VerifiedEnvelope<T, S> {
-    fn check_version_supported(&self, protocol_config: &ProtocolConfig) -> SuiResult {
-        self.inner().check_version_supported(protocol_config)
     }
 }
 
@@ -445,6 +450,31 @@ impl<T: Message> VerifiedEnvelope<T, CertificateProof> {
             digest,
             data,
             auth_signature: CertificateProof::QuorumExecuted(epoch),
+        })
+    }
+
+    pub fn new_from_consensus(
+        transaction: VerifiedEnvelope<T, EmptySignInfo>,
+        epoch: EpochId,
+        round: Round,
+        authority: AuthorityIndex,
+        transaction_index: TransactionIndex,
+    ) -> Self {
+        let inner = transaction.into_inner();
+        let Envelope {
+            digest,
+            data,
+            auth_signature: _,
+        } = inner;
+        VerifiedEnvelope::new_unchecked(Envelope {
+            digest,
+            data,
+            auth_signature: CertificateProof::new_from_consensus(
+                epoch,
+                round,
+                authority,
+                transaction_index,
+            ),
         })
     }
 

@@ -1,6 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::drivers::Interval;
 use crate::in_memory_wallet::InMemoryWallet;
 use crate::system_state_observer::SystemStateObserver;
 use crate::workloads::payload::Payload;
@@ -14,18 +15,19 @@ use std::sync::Arc;
 use sui_core::test_utils::make_pay_sui_transaction;
 use sui_types::base_types::{ObjectID, SequenceNumber};
 use sui_types::digests::ObjectDigest;
+use sui_types::gas_coin::MIST_PER_SUI;
 use sui_types::object::Owner;
 use sui_types::{
     base_types::{ObjectRef, SuiAddress},
     crypto::get_key_pair,
-    messages::VerifiedTransaction,
+    transaction::Transaction,
 };
 use tracing::{debug, error};
 
 /// Value of each address's "primary coin" in mist. The first transaction gives
 /// each address a coin worth PRIMARY_COIN_VALUE, and all subsequent transfers
 /// send TRANSFER_AMOUNT coins each time
-const PRIMARY_COIN_VALUE: u64 = 100_000_000_000;
+const PRIMARY_COIN_VALUE: u64 = 100 * MIST_PER_SUI;
 
 /// Number of mist sent to each address on each batch transfer
 const BATCH_TRANSFER_AMOUNT: u64 = 1;
@@ -53,7 +55,7 @@ impl Payload for BatchPaymentTestPayload {
     fn make_new_payload(&mut self, effects: &ExecutionEffects) {
         if !effects.is_ok() {
             effects.print_gas_summary();
-            error!("Batch payment failed...");
+            error!("Batch payment failed... Status: {:?}", effects.status());
         }
 
         self.state.update(effects);
@@ -69,7 +71,7 @@ impl Payload for BatchPaymentTestPayload {
         self.num_payments += self.state.num_addresses();
     }
 
-    fn make_transaction(&mut self) -> VerifiedTransaction {
+    fn make_transaction(&mut self) -> Transaction {
         let addrs = self.state.addresses().cloned().collect::<Vec<SuiAddress>>();
         let num_recipients = addrs.len();
         let sender = if self.num_payments == 0 {
@@ -107,13 +109,11 @@ impl Payload for BatchPaymentTestPayload {
             vec![amount; num_recipients],
             sender,
             &self.state.keypair(&sender).unwrap(),
-            Some(
-                self.system_state_observer
-                    .state
-                    .borrow()
-                    .reference_gas_price,
-            ),
-            Some(gas_budget),
+            self.system_state_observer
+                .state
+                .borrow()
+                .reference_gas_price,
+            gas_budget,
         )
     }
 }
@@ -131,6 +131,8 @@ impl BatchPaymentWorkloadBuilder {
         num_workers: u64,
         in_flight_ratio: u64,
         batch_size: u32,
+        duration: Interval,
+        group: u32,
     ) -> Option<WorkloadBuilderInfo> {
         let target_qps = (workload_weight * target_qps as f32) as u64;
         let num_workers = (workload_weight * num_workers as f32).ceil() as u64;
@@ -142,6 +144,8 @@ impl BatchPaymentWorkloadBuilder {
                 target_qps,
                 num_workers,
                 max_ops,
+                duration,
+                group,
             };
             let workload_builder = Box::<dyn WorkloadBuilder<dyn Payload>>::from(Box::new(
                 BatchPaymentWorkloadBuilder {

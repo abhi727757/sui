@@ -14,15 +14,19 @@ use network::client::NetworkClient;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::{sync::Arc, time::Duration, vec};
+use tracing::warn;
+use types::error::LocalClientError;
 use types::FetchBatchesRequest;
 
 use fastcrypto::hash::Hash;
+use mysten_metrics::metered_channel;
 use mysten_metrics::spawn_logged_monitored_task;
+use sui_protocol_config::ProtocolConfig;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info};
 use types::{
-    metered_channel, Batch, BatchAPI, BatchDigest, Certificate, CertificateAPI, CommittedSubDag,
-    ConditionalBroadcastReceiver, ConsensusOutput, HeaderAPI, Timestamp,
+    Batch, BatchAPI, BatchDigest, Certificate, CertificateAPI, CommittedSubDag,
+    ConditionalBroadcastReceiver, ConsensusOutput, HeaderAPI, MetadataAPI, Timestamp,
 };
 
 /// The `Subscriber` receives certificates sequenced by the consensus and waits until the
@@ -41,6 +45,7 @@ struct Inner {
     authority_id: AuthorityIdentifier,
     worker_cache: WorkerCache,
     committee: Committee,
+    _protocol_config: ProtocolConfig,
     client: NetworkClient,
     metrics: Arc<ExecutorMetrics>,
 }
@@ -49,6 +54,7 @@ pub fn spawn_subscriber<State: ExecutionState + Send + Sync + 'static>(
     authority_id: AuthorityIdentifier,
     worker_cache: WorkerCache,
     committee: Committee,
+    protocol_config: ProtocolConfig,
     client: NetworkClient,
     mut shutdown_receivers: Vec<ConditionalBroadcastReceiver>,
     rx_sequence: metered_channel::Receiver<CommittedSubDag>,
@@ -81,6 +87,7 @@ pub fn spawn_subscriber<State: ExecutionState + Send + Sync + 'static>(
                 authority_id,
                 worker_cache,
                 committee,
+                protocol_config.clone(),
                 rx_shutdown_subscriber,
                 rx_sequence,
                 client,
@@ -94,7 +101,7 @@ pub fn spawn_subscriber<State: ExecutionState + Send + Sync + 'static>(
 }
 
 async fn run_notify<State: ExecutionState + Send + Sync + 'static>(
-    state: State,
+    mut state: State,
     mut rx_notify: metered_channel::Receiver<ConsensusOutput>,
     mut rx_shutdown: ConditionalBroadcastReceiver,
 ) {
@@ -107,7 +114,6 @@ async fn run_notify<State: ExecutionState + Send + Sync + 'static>(
             _ = rx_shutdown.receiver.recv() => {
                 return
             }
-
         }
     }
 }
@@ -116,6 +122,7 @@ async fn create_and_run_subscriber(
     authority_id: AuthorityIdentifier,
     worker_cache: WorkerCache,
     committee: Committee,
+    _protocol_config: ProtocolConfig,
     rx_shutdown: ConditionalBroadcastReceiver,
     rx_sequence: metered_channel::Receiver<CommittedSubDag>,
     client: NetworkClient,
@@ -130,6 +137,7 @@ async fn create_and_run_subscriber(
         inner: Arc::new(Inner {
             authority_id,
             committee,
+            _protocol_config,
             worker_cache,
             client,
             metrics,
@@ -213,7 +221,8 @@ impl Subscriber {
             debug!("No batches to fetch, payload is empty");
             return ConsensusOutput {
                 sub_dag: Arc::new(deliver),
-                batches: vec![],
+                // Length of `batches` must match certificate count in `sub_dag` even if empty.
+                batches: vec![Vec::new(); num_certs],
             };
         }
 
@@ -263,11 +272,17 @@ impl Subscriber {
             Self::fetch_batches_from_workers(&inner, batch_digests_and_workers).await;
         drop(fetched_batches_timer);
 
+        for batch in fetched_batches.values() {
+            inner
+                .metrics
+                .consensus_output_transactions
+                .inc_by(batch.transactions().len() as u64);
+        }
+
         // Map all fetched batches to their respective certificates and submit as
         // consensus output
         for cert in &sub_dag.certificates {
             let mut output_batches = Vec::with_capacity(cert.header().payload().len());
-            let output_cert = cert.clone();
 
             inner
                 .metrics
@@ -291,9 +306,7 @@ impl Subscriber {
                 );
                 output_batches.push(batch.clone());
             }
-            subscriber_output
-                .batches
-                .push((output_cert, output_batches));
+            subscriber_output.batches.push(output_batches);
         }
         subscriber_output
     }
@@ -355,7 +368,9 @@ impl Subscriber {
                 {
                     Ok(resp) => break resp.batches,
                     Err(e) => {
-                        error!("Failed to fetch batches from worker {worker_name}: {e:?}");
+                        if !matches!(e, LocalClientError::ShuttingDown) {
+                            warn!("Failed to fetch batches from worker {worker_name}: {e:?}");
+                        }
                         // Loop forever on failure. During shutdown, this should get cancelled.
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         continue;
@@ -363,16 +378,58 @@ impl Subscriber {
                 }
             };
             for (digest, batch) in batches {
-                let batch_fetch_duration = batch.metadata().created_at.elapsed().as_secs_f64();
-                inner
-                    .metrics
-                    .batch_execution_latency
-                    .observe(batch_fetch_duration);
+                Self::record_fetched_batch_metrics(inner, &batch, &digest);
                 fetched_batches.insert(digest, batch);
             }
         }
 
         fetched_batches
+    }
+
+    fn record_fetched_batch_metrics(inner: &Inner, batch: &Batch, digest: &BatchDigest) {
+        let metadata = batch.versioned_metadata();
+        if let Some(received_at) = metadata.received_at() {
+            let remote_duration = received_at.elapsed().as_secs_f64();
+            debug!(
+                "Batch was fetched for execution after being received from another worker {}s ago.",
+                remote_duration
+            );
+            inner
+                .metrics
+                .batch_execution_local_latency
+                .with_label_values(&["other"])
+                .observe(remote_duration);
+        } else {
+            let local_duration = batch
+                .versioned_metadata()
+                .created_at()
+                .elapsed()
+                .as_secs_f64();
+            debug!(
+                "Batch was fetched for execution after being created locally {}s ago.",
+                local_duration
+            );
+            inner
+                .metrics
+                .batch_execution_local_latency
+                .with_label_values(&["own"])
+                .observe(local_duration);
+        };
+
+        let batch_fetch_duration = batch
+            .versioned_metadata()
+            .created_at()
+            .elapsed()
+            .as_secs_f64();
+        inner
+            .metrics
+            .batch_execution_latency
+            .observe(batch_fetch_duration);
+        debug!(
+            "Batch {:?} took {} seconds since it has been created to when it has been fetched for execution",
+            digest,
+            batch_fetch_duration,
+        );
     }
 }
 

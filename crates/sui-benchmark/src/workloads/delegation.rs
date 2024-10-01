@@ -1,6 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::drivers::Interval;
 use crate::system_state_observer::SystemStateObserver;
 use crate::workloads::payload::Payload;
 use crate::workloads::workload::{Workload, WorkloadBuilder};
@@ -13,10 +14,11 @@ use async_trait::async_trait;
 use rand::seq::IteratorRandom;
 use std::sync::Arc;
 use sui_core::test_utils::make_transfer_sui_transaction;
+use sui_test_transaction_builder::TestTransactionBuilder;
 use sui_types::base_types::{ObjectRef, SuiAddress};
 use sui_types::crypto::{get_key_pair, AccountKeyPair};
-use sui_types::messages::VerifiedTransaction;
-use test_utils::messages::make_staking_transaction;
+use sui_types::gas_coin::MIST_PER_SUI;
+use sui_types::transaction::Transaction;
 use tracing::error;
 
 #[derive(Debug)]
@@ -39,11 +41,11 @@ impl Payload for DelegationTestPayload {
     fn make_new_payload(&mut self, effects: &ExecutionEffects) {
         if !effects.is_ok() {
             effects.print_gas_summary();
-            error!("Delegation tx failed...");
+            error!("Delegation tx failed... Status: {:?}", effects.status());
         }
 
         let coin = match self.coin {
-            None => Some(effects.created().get(0).unwrap().0),
+            None => Some(effects.created().first().unwrap().0),
             Some(_) => None,
         };
         self.coin = coin;
@@ -53,33 +55,28 @@ impl Payload for DelegationTestPayload {
     /// delegation flow is split into two phases
     /// first `make_transaction` call creates separate coin object for future delegation
     /// followup call creates delegation transaction itself
-    fn make_transaction(&mut self) -> VerifiedTransaction {
+    fn make_transaction(&mut self) -> Transaction {
         match self.coin {
-            Some(coin) => make_staking_transaction(
-                self.gas,
-                coin,
-                self.validator,
+            Some(coin) => TestTransactionBuilder::new(
                 self.sender,
-                self.keypair.as_ref(),
-                Some(
-                    self.system_state_observer
-                        .state
-                        .borrow()
-                        .reference_gas_price,
-                ),
-            ),
+                self.gas,
+                self.system_state_observer
+                    .state
+                    .borrow()
+                    .reference_gas_price,
+            )
+            .call_staking(coin, self.validator)
+            .build_and_sign(self.keypair.as_ref()),
             None => make_transfer_sui_transaction(
                 self.gas,
                 self.sender,
-                Some(1),
+                Some(MIST_PER_SUI),
                 self.sender,
                 &self.keypair,
-                Some(
-                    self.system_state_observer
-                        .state
-                        .borrow()
-                        .reference_gas_price,
-                ),
+                self.system_state_observer
+                    .state
+                    .borrow()
+                    .reference_gas_price,
             ),
         }
     }
@@ -96,6 +93,8 @@ impl DelegationWorkloadBuilder {
         target_qps: u64,
         num_workers: u64,
         in_flight_ratio: u64,
+        duration: Interval,
+        group: u32,
     ) -> Option<WorkloadBuilderInfo> {
         let target_qps = (workload_weight * target_qps as f32) as u64;
         let num_workers = (workload_weight * num_workers as f32).ceil() as u64;
@@ -107,6 +106,8 @@ impl DelegationWorkloadBuilder {
                 target_qps,
                 num_workers,
                 max_ops,
+                duration,
+                group,
             };
             let workload_builder = Box::<dyn WorkloadBuilder<dyn Payload>>::from(Box::new(
                 DelegationWorkloadBuilder { count: max_ops },

@@ -5,12 +5,13 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sui_types::base_types::SuiAddress;
-use sui_types::{base_types::ObjectID, messages::TransactionData};
-use typed_store::rocks::{DBMap, TypedStoreError};
+use sui_types::{base_types::ObjectID, transaction::TransactionData};
 use typed_store::traits::{TableSummary, TypedStoreDebug};
 use typed_store::Map;
+use typed_store::{rocks::DBMap, TypedStoreError};
 
-use typed_store_derive::DBMapUtils;
+use tracing::info;
+use typed_store::DBMapUtils;
 use uuid::Uuid;
 
 /// Persistent log of transactions paying out sui from the faucet, keyed by the coin serving the
@@ -28,16 +29,18 @@ pub struct WriteAheadLog {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 pub struct Entry {
     pub uuid: uuid::Bytes,
+    // TODO (jian): remove recipient
     pub recipient: SuiAddress,
     pub tx: TransactionData,
     pub retry_count: u64,
+    pub in_flight: bool,
 }
 
 impl WriteAheadLog {
     pub(crate) fn open(path: &Path) -> Self {
         Self::open_tables_read_write(
             path.to_path_buf(),
-            typed_store::rocks::MetricConf::default(),
+            typed_store::rocks::MetricConf::new("faucet_write_ahead_log"),
             None,
             None,
         )
@@ -68,6 +71,7 @@ impl WriteAheadLog {
                 recipient,
                 tx,
                 retry_count: 0,
+                in_flight: true,
             },
         )
     }
@@ -76,7 +80,18 @@ impl WriteAheadLog {
     /// pending transaction exists, `Ok(None)` if not, and `Err(_)` if there was an internal error
     /// accessing the WAL.
     pub(crate) fn reclaim(&self, coin: ObjectID) -> Result<Option<Entry>, TypedStoreError> {
-        self.log.get(&coin)
+        match self.log.get(&coin) {
+            Ok(entry) => Ok(entry),
+            Err(TypedStoreError::SerializationError(_)) => {
+                // Remove bad log from the store, so we don't crash on start up, this can happen if we update the
+                // WAL Entry and have some leftover Entry from the WAL.
+                self.log
+                    .remove(&coin)
+                    .expect("Coin: {coin:?} unable to be removed from log.");
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Indicate that the transaction in flight for `coin` has landed, and the entry in the WAL can
@@ -92,11 +107,35 @@ impl WriteAheadLog {
         }
         Ok(())
     }
+
+    pub(crate) fn set_in_flight(
+        &mut self,
+        coin: ObjectID,
+        bool: bool,
+    ) -> Result<(), TypedStoreError> {
+        if let Some(mut entry) = self.log.get(&coin)? {
+            entry.in_flight = bool;
+            self.log.insert(&coin, &entry)?;
+        } else {
+            info!(
+                ?coin,
+                "Attempted to set inflight a coin that was not in the WAL."
+            );
+
+            return Err(TypedStoreError::RocksDBError(format!(
+                "Coin object {coin:?} not found in WAL."
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use sui_types::base_types::{random_object_ref, ObjectRef};
+    use sui_types::{
+        base_types::{random_object_ref, ObjectRef},
+        transaction::TEST_ONLY_GAS_UNIT_FOR_TRANSFER,
+    };
 
     use super::*;
 
@@ -214,17 +253,19 @@ mod tests {
     }
 
     fn random_request(coin: ObjectRef) -> (SuiAddress, TransactionData) {
+        let gas_price = 1;
         let send = SuiAddress::random_for_testing_only();
         let recv = SuiAddress::random_for_testing_only();
         (
             recv,
-            TransactionData::new_pay_sui_with_dummy_gas_price(
+            TransactionData::new_pay_sui(
                 send,
                 vec![coin],
                 vec![recv],
                 vec![1000],
                 coin,
-                1000,
+                gas_price * TEST_ONLY_GAS_UNIT_FOR_TRANSFER,
+                gas_price,
             )
             .unwrap(),
         )

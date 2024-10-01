@@ -1,28 +1,33 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use move_binary_format::binary_config::BinaryConfig;
+use move_binary_format::compatibility::Compatibility;
+use move_binary_format::file_format::{Ability, AbilitySet};
 use move_binary_format::CompiledModule;
 use move_core_types::gas_algebra::InternalGas;
 use once_cell::sync::Lazy;
-use std::path::Path;
-use sui_framework_build::compiled_package::{BuildConfig, CompiledPackage};
+use serde::{Deserialize, Serialize};
+use std::fmt::Formatter;
+use sui_types::base_types::ObjectRef;
+use sui_types::storage::ObjectStore;
 use sui_types::{
     base_types::ObjectID,
     digests::TransactionDigest,
-    error::SuiResult,
     move_package::MovePackage,
     object::{Object, OBJECT_START_VERSION},
-    MOVE_STDLIB_OBJECT_ID, SUI_FRAMEWORK_OBJECT_ID, SUI_SYSTEM_PACKAGE_ID,
+    MOVE_STDLIB_PACKAGE_ID, SUI_FRAMEWORK_PACKAGE_ID, SUI_SYSTEM_PACKAGE_ID,
 };
-
-pub mod natives;
+use sui_types::{BRIDGE_PACKAGE_ID, DEEPBOOK_PACKAGE_ID};
+use tracing::error;
 
 /// Represents a system package in the framework, that's built from the source code inside
 /// sui-framework.
+#[derive(Clone, Serialize, PartialEq, Eq, Deserialize)]
 pub struct SystemPackage {
-    id: ObjectID,
-    bytes: Vec<Vec<u8>>,
-    dependencies: Vec<ObjectID>,
+    pub id: ObjectID,
+    pub bytes: Vec<Vec<u8>>,
+    pub dependencies: Vec<ObjectID>,
 }
 
 impl SystemPackage {
@@ -50,7 +55,7 @@ impl SystemPackage {
     pub fn modules(&self) -> Vec<CompiledModule> {
         self.bytes
             .iter()
-            .map(|b| CompiledModule::deserialize(b).unwrap())
+            .map(|b| CompiledModule::deserialize_with_defaults(b).unwrap())
             .collect()
     }
 
@@ -67,8 +72,17 @@ impl SystemPackage {
             &self.modules(),
             OBJECT_START_VERSION,
             self.dependencies.to_vec(),
-            TransactionDigest::genesis(),
+            TransactionDigest::genesis_marker(),
         )
+    }
+}
+
+impl std::fmt::Debug for SystemPackage {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Object ID: {:?}", self.id)?;
+        writeln!(f, "Size: {}", self.bytes.len())?;
+        writeln!(f, "Dependencies: {:?}", self.dependencies)?;
+        Ok(())
     }
 }
 
@@ -78,12 +92,12 @@ macro_rules! define_system_packages {
             vec![
                 $(SystemPackage::new(
                     $id,
-                    include_bytes!(concat!(env!("OUT_DIR"), "/", $path)),
+                    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/packages_compiled", "/", $path)),
                     &$deps,
                 )),*
             ]
         });
-        &Lazy::force(&PACKAGES)
+        Lazy::force(&PACKAGES)
     }}
 }
 
@@ -94,16 +108,30 @@ impl BuiltInFramework {
         // place we need to worry about if any of them changes.
         // TODO: Is it possible to derive dependencies from the bytecode instead of manually specifying them?
         define_system_packages!([
-            (MOVE_STDLIB_OBJECT_ID, "move-stdlib", []),
+            (MOVE_STDLIB_PACKAGE_ID, "move-stdlib", []),
             (
-                SUI_FRAMEWORK_OBJECT_ID,
+                SUI_FRAMEWORK_PACKAGE_ID,
                 "sui-framework",
-                [MOVE_STDLIB_OBJECT_ID]
+                [MOVE_STDLIB_PACKAGE_ID]
             ),
             (
                 SUI_SYSTEM_PACKAGE_ID,
                 "sui-system",
-                [MOVE_STDLIB_OBJECT_ID, SUI_FRAMEWORK_OBJECT_ID]
+                [MOVE_STDLIB_PACKAGE_ID, SUI_FRAMEWORK_PACKAGE_ID]
+            ),
+            (
+                DEEPBOOK_PACKAGE_ID,
+                "deepbook",
+                [MOVE_STDLIB_PACKAGE_ID, SUI_FRAMEWORK_PACKAGE_ID]
+            ),
+            (
+                BRIDGE_PACKAGE_ID,
+                "bridge",
+                [
+                    MOVE_STDLIB_PACKAGE_ID,
+                    SUI_FRAMEWORK_PACKAGE_ID,
+                    SUI_SYSTEM_PACKAGE_ID
+                ]
             )
         ])
         .iter()
@@ -132,15 +160,110 @@ pub fn legacy_test_cost() -> InternalGas {
     InternalGas::new(0)
 }
 
-/// Wrapper of the build command that verifies the framework version. Should eventually be removed once we can
-/// do this in the obvious way (via version checks)
-pub fn build_move_package(path: &Path, config: BuildConfig) -> SuiResult<CompiledPackage> {
-    //let test_mode = config.config.test_mode;
-    let pkg = config.build(path.to_path_buf())?;
-    /*if test_mode {
-        pkg.verify_framework_version(get_sui_framework_test(), get_move_stdlib_test())?;
-    } else {
-        pkg.verify_framework_version(get_sui_framework(), get_move_stdlib())?;
-    }*/
-    Ok(pkg)
+/// Check whether the framework defined by `modules` is compatible with the framework that is
+/// already on-chain (i.e. stored in `object_store`) at `id`.
+///
+/// - Returns `None` if the current package at `id` cannot be loaded, or the compatibility check
+///   fails (This is grounds not to upgrade).
+/// - Panics if the object at `id` can be loaded but is not a package -- this is an invariant
+///   violation.
+/// - Returns the digest of the current framework (and version) if it is equivalent to the new
+///   framework (indicates support for a protocol upgrade without a framework upgrade).
+/// - Returns the digest of the new framework (and version) if it is compatible (indicates
+///   support for a protocol upgrade with a framework upgrade).
+pub async fn compare_system_package<S: ObjectStore>(
+    object_store: &S,
+    id: &ObjectID,
+    modules: &[CompiledModule],
+    dependencies: Vec<ObjectID>,
+    binary_config: &BinaryConfig,
+) -> Option<ObjectRef> {
+    let cur_object = match object_store.get_object(id) {
+        Ok(Some(cur_object)) => cur_object,
+
+        Ok(None) => {
+            // creating a new framework package--nothing to check
+            return Some(
+                Object::new_system_package(
+                    modules,
+                    // note: execution_engine assumes any system package with version OBJECT_START_VERSION is freshly created
+                    // rather than upgraded
+                    OBJECT_START_VERSION,
+                    dependencies,
+                    // Genesis is fine here, we only use it to calculate an object ref that we can use
+                    // for all validators to commit to the same bytes in the update
+                    TransactionDigest::genesis_marker(),
+                )
+                .compute_object_reference(),
+            );
+        }
+
+        Err(e) => {
+            error!("Error loading framework object at {id}: {e:?}");
+            return None;
+        }
+    };
+
+    let cur_ref = cur_object.compute_object_reference();
+    let cur_pkg = cur_object
+        .data
+        .try_as_package()
+        .expect("Framework not package");
+
+    let mut new_object = Object::new_system_package(
+        modules,
+        // Start at the same version as the current package, and increment if compatibility is
+        // successful
+        cur_object.version(),
+        dependencies,
+        cur_object.previous_transaction,
+    );
+
+    if cur_ref == new_object.compute_object_reference() {
+        return Some(cur_ref);
+    }
+
+    let compatibility = Compatibility {
+        check_datatype_and_pub_function_linking: true,
+        check_datatype_layout: true,
+        check_friend_linking: false,
+        // Checking `entry` linkage is required because system packages are updated in-place, and a
+        // transaction that was rolled back to make way for reconfiguration should still be runnable
+        // after a reconfiguration that upgraded the framework.
+        //
+        // A transaction that calls a system function that was previously `entry` and is now private
+        // will fail because its entrypoint became no longer callable. A transaction that calls a
+        // system function that was previously `public entry` and is now just `public` could also
+        // fail if one of its mutable inputs was being used in another private `entry` function.
+        check_private_entry_linking: true,
+        disallowed_new_abilities: AbilitySet::singleton(Ability::Key),
+        disallow_change_datatype_type_params: true,
+        disallow_new_variants: true,
+    };
+
+    let new_pkg = new_object
+        .data
+        .try_as_package_mut()
+        .expect("Created as package");
+
+    let cur_normalized = match cur_pkg.normalize(binary_config) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("Could not normalize existing package: {e:?}");
+            return None;
+        }
+    };
+    let mut new_normalized = new_pkg.normalize(binary_config).ok()?;
+
+    for (name, cur_module) in cur_normalized {
+        let new_module = new_normalized.remove(&name)?;
+
+        if let Err(e) = compatibility.check(&cur_module, &new_module) {
+            error!("Compatibility check failed, for new version of {id}::{name}: {e:?}");
+            return None;
+        }
+    }
+
+    new_pkg.increment_version();
+    Some(new_object.compute_object_reference())
 }

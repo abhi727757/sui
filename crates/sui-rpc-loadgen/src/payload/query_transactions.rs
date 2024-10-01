@@ -11,11 +11,10 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use sui_json_rpc_types::{
     Page, SuiTransactionBlockResponse, SuiTransactionBlockResponseOptions,
-    SuiTransactionBlockResponseQuery, TransactionBlocksPage,
+    SuiTransactionBlockResponseQuery, TransactionBlocksPage, TransactionFilter,
 };
 use sui_sdk::SuiClient;
 use sui_types::base_types::TransactionDigest;
-use sui_types::query::TransactionFilter;
 use tracing::log::warn;
 
 #[async_trait]
@@ -69,7 +68,7 @@ impl<'a> ProcessPayload<'a, &'a QueryTransactionBlocks> for RpcCommandProcessor 
                     None
                 } else {
                     match (
-                        results.get(0).unwrap().next_cursor,
+                        results.first().unwrap().next_cursor,
                         results.get(1).unwrap().next_cursor,
                     ) {
                         (Some(first_cursor), Some(second_cursor)) => {
@@ -83,7 +82,7 @@ impl<'a> ProcessPayload<'a, &'a QueryTransactionBlocks> for RpcCommandProcessor 
                     }
                 };
 
-                results = join_all(clients.iter().enumerate().map(|(_i, client)| {
+                results = join_all(clients.iter().map(|client| {
                     let with_query = query.clone();
                     async move {
                         query_transaction_blocks(client, with_query, cursor, None)

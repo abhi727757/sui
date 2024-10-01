@@ -2,10 +2,11 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 use super::*;
+use crate::consensus::LeaderSwapTable;
 use crate::NUM_SHUTDOWN_RECEIVERS;
 use indexmap::IndexMap;
 use prometheus::Registry;
-use test_utils::{fixture_payload, CommitteeFixture};
+use test_utils::{fixture_payload, latest_protocol_version, CommitteeFixture};
 use types::PreSubscribedBroadcastSender;
 
 #[tokio::test]
@@ -29,13 +30,13 @@ async fn propose_empty() {
     let _proposer_handle = Proposer::spawn(
         name,
         committee.clone(),
+        &latest_protocol_version(),
         ProposerStore::new_for_tests(),
         /* header_num_of_batches_threshold */ 32,
         /* max_header_num_of_batches */ 100,
         /* max_header_delay */ Duration::from_millis(20),
         /* min_header_delay */ Duration::from_millis(20),
         None,
-        NetworkModel::PartiallySynchronous,
         tx_shutdown.subscribe(),
         /* rx_core */ rx_parents,
         /* rx_workers */ rx_our_digests,
@@ -43,6 +44,7 @@ async fn propose_empty() {
         tx_narwhal_round_updates,
         rx_committed_own_headers,
         metrics,
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
     );
 
     // Ensure the proposer makes a correct empty header.
@@ -76,6 +78,7 @@ async fn propose_payload_and_repropose_after_n_seconds() {
     let _proposer_handle = Proposer::spawn(
         name,
         committee.clone(),
+        &latest_protocol_version(),
         ProposerStore::new_for_tests(),
         /* header_num_of_batches_threshold */ 1,
         /* max_header_num_of_batches */ max_num_of_batches,
@@ -84,7 +87,6 @@ async fn propose_payload_and_repropose_after_n_seconds() {
         /* min_header_delay */
         Duration::from_millis(1_000_000), // Ensure it is not triggered.
         Some(header_resend_delay),
-        NetworkModel::PartiallySynchronous,
         tx_shutdown.subscribe(),
         /* rx_core */ rx_parents,
         /* rx_workers */ rx_our_digests,
@@ -92,6 +94,7 @@ async fn propose_payload_and_repropose_after_n_seconds() {
         tx_narwhal_round_updates,
         rx_committed_own_headers,
         metrics,
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
     );
 
     // Send enough digests for the header payload.
@@ -124,7 +127,7 @@ async fn propose_payload_and_repropose_after_n_seconds() {
 
     // WHEN available batches are more than the maximum ones
     let batches: IndexMap<BatchDigest, (WorkerId, TimestampMs)> =
-        fixture_payload((max_num_of_batches * 2) as u8);
+        fixture_payload((max_num_of_batches * 2) as u8, &latest_protocol_version());
 
     let mut ack_list = vec![];
     for (batch_id, (worker_id, created_at)) in batches {
@@ -146,13 +149,13 @@ async fn propose_payload_and_repropose_after_n_seconds() {
 
     // AND send some parents to advance the round
     let parents: Vec<_> = fixture
-        .headers()
+        .headers(&latest_protocol_version())
         .iter()
         .take(4)
-        .map(|h| fixture.certificate(h))
+        .map(|h| fixture.certificate(&latest_protocol_version(), h))
         .collect();
 
-    let result = tx_parents.send((parents, 1, 0)).await;
+    let result = tx_parents.send((parents, 1)).await;
     assert!(result.is_ok());
 
     // THEN the header should contain max_num_of_batches
@@ -198,6 +201,7 @@ async fn equivocation_protection() {
     let proposer_handle = Proposer::spawn(
         authority_id,
         committee.clone(),
+        &latest_protocol_version(),
         proposer_store.clone(),
         /* header_num_of_batches_threshold */ 1,
         /* max_header_num_of_batches */ 10,
@@ -206,7 +210,6 @@ async fn equivocation_protection() {
         /* min_header_delay */
         Duration::from_millis(1_000_000), // Ensure it is not triggered.
         None,
-        NetworkModel::PartiallySynchronous,
         tx_shutdown.subscribe(),
         /* rx_core */ rx_parents,
         /* rx_workers */ rx_our_digests,
@@ -214,6 +217,7 @@ async fn equivocation_protection() {
         tx_narwhal_round_updates,
         rx_committed_own_headers,
         metrics,
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
     );
 
     // Send enough digests for the header payload.
@@ -237,13 +241,13 @@ async fn equivocation_protection() {
 
     // Create and send parents
     let parents: Vec<_> = fixture
-        .headers()
+        .headers(&latest_protocol_version())
         .iter()
         .take(3)
-        .map(|h| fixture.certificate(h))
+        .map(|h| fixture.certificate(&latest_protocol_version(), h))
         .collect();
 
-    let result = tx_parents.send((parents, 1, 0)).await;
+    let result = tx_parents.send((parents, 1)).await;
     assert!(result.is_ok());
     assert!(rx_ack.await.is_ok());
 
@@ -270,6 +274,7 @@ async fn equivocation_protection() {
     let _proposer_handle = Proposer::spawn(
         authority_id,
         committee.clone(),
+        &latest_protocol_version(),
         proposer_store,
         /* header_num_of_batches_threshold */ 1,
         /* max_header_num_of_batches */ 10,
@@ -278,7 +283,6 @@ async fn equivocation_protection() {
         /* min_header_delay */
         Duration::from_millis(1_000_000), // Ensure it is not triggered.
         None,
-        NetworkModel::PartiallySynchronous,
         tx_shutdown.subscribe(),
         /* rx_core */ rx_parents,
         /* rx_workers */ rx_our_digests,
@@ -286,6 +290,7 @@ async fn equivocation_protection() {
         tx_narwhal_round_updates,
         rx_committed_own_headers,
         metrics,
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
     );
 
     // Send enough digests for the header payload.
@@ -308,13 +313,13 @@ async fn equivocation_protection() {
 
     // Create and send a superset parents, same round but different set from before
     let parents: Vec<_> = fixture
-        .headers()
+        .headers(&latest_protocol_version())
         .iter()
         .take(4)
-        .map(|h| fixture.certificate(h))
+        .map(|h| fixture.certificate(&latest_protocol_version(), h))
         .collect();
 
-    let result = tx_parents.send((parents, 1, 0)).await;
+    let result = tx_parents.send((parents, 1)).await;
     assert!(result.is_ok());
     assert!(rx_ack.await.is_ok());
 

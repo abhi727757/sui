@@ -15,6 +15,12 @@ pub struct NetworkConnectionMetrics {
     pub network_peer_connected: IntGaugeVec,
     /// The number of connected peers
     pub network_peers: IntGauge,
+    /// Number of disconnect events per peer.
+    pub network_peer_disconnects: IntCounterVec,
+    /// Receive buffer size of Anemo socket.
+    pub socket_receive_buffer_size: IntGauge,
+    /// Send buffer size of Anemo socket.
+    pub socket_send_buffer_size: IntGauge,
 
     /// PathStats
     /// The rtt for a peer connection in ms.
@@ -60,6 +66,25 @@ impl NetworkConnectionMetrics {
             network_peers: register_int_gauge_with_registry!(
                 format!("{node}_network_peers"),
                 "The number of connected peers.",
+                registry
+            )
+            .unwrap(),
+            network_peer_disconnects: register_int_counter_vec_with_registry!(
+                format!("{node}_network_peer_disconnects"),
+                "Number of disconnect events per peer.",
+                &["peer_id", "reason"],
+                registry
+            )
+            .unwrap(),
+            socket_receive_buffer_size: register_int_gauge_with_registry!(
+                format!("{node}_socket_receive_buffer_size"),
+                "Receive buffer size of Anemo socket.",
+                registry
+            )
+            .unwrap(),
+            socket_send_buffer_size: register_int_gauge_with_registry!(
+                format!("{node}_socket_send_buffer_size"),
+                "Send buffer size of Anemo socket.",
                 registry
             )
             .unwrap(),

@@ -6,7 +6,32 @@ use proptest::collection;
 use proptest::prelude::*;
 
 #[test]
-fn temp_test() {
+fn serde_keypair() {
+    let skp = SuiKeyPair::Ed25519(Ed25519KeyPair::generate(&mut StdRng::from_seed([0; 32])));
+    let encoded = skp.encode().unwrap();
+    assert_eq!(
+        encoded,
+        "suiprivkey1qzdlfxn2qa2lj5uprl8pyhexs02sg2wrhdy7qaq50cqgnffw4c2477kg9h3"
+    );
+    let decoded = SuiKeyPair::decode(&encoded).unwrap();
+    assert_eq!(skp, decoded);
+}
+
+#[test]
+fn serde_pubkey() {
+    let skp = SuiKeyPair::Ed25519(get_key_pair().1);
+    let ser = serde_json::to_string(&skp.public()).unwrap();
+    assert_eq!(
+        ser,
+        format!(
+            "{{\"Ed25519\":\"{}\"}}",
+            Base64::encode(skp.public().as_ref())
+        )
+    );
+}
+
+#[test]
+fn serde_round_trip_authority_quorum_sign_info() {
     let info = AuthorityQuorumSignInfo::<true> {
         epoch: 0,
         signature: Default::default(),

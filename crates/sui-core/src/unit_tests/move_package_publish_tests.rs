@@ -6,32 +6,34 @@ use crate::authority::{
     move_integration_tests::{build_and_publish_test_package, build_test_package},
 };
 
+use move_binary_format::CompiledModule;
 use sui_types::{
     base_types::ObjectID,
     error::UserInputError,
-    messages::{ExecutionFailureStatus, TransactionData, TransactionEffectsAPI},
     object::{Data, ObjectRead, Owner},
+    transaction::{TransactionData, TEST_ONLY_GAS_UNIT_FOR_PUBLISH},
     utils::to_sender_signed_transaction,
 };
 
 use move_package::source_package::manifest_parser;
-use sui_framework_build::compiled_package::{
-    check_unpublished_dependencies, gather_published_ids, BuildConfig,
-};
+use sui_move_build::{check_unpublished_dependencies, gather_published_ids, BuildConfig};
 use sui_types::{
     crypto::{get_key_pair, AccountKeyPair},
     error::SuiError,
-    messages::ExecutionStatus,
 };
 
+use crate::authority::move_integration_tests::{
+    build_multi_publish_txns, build_package, run_multi_txns,
+};
 use expect_test::expect;
 use std::env;
 use std::fs::File;
 use std::io::Read;
 use std::{collections::HashSet, path::PathBuf};
 use sui_framework::BuiltInFramework;
-
-const MAX_GAS: u64 = 10000;
+use sui_types::effects::TransactionEffectsAPI;
+use sui_types::execution_status::{ExecutionFailureStatus, ExecutionStatus};
+use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
 
 #[tokio::test]
 #[cfg_attr(msim, ignore)]
@@ -50,15 +52,14 @@ async fn test_publishing_with_unpublished_deps() {
     )
     .await;
 
-    let ObjectRead::Exists(read_ref, package_obj, _) = authority
-        .get_object_read(&package.0)
-        .unwrap()
+    let ObjectRead::Exists(read_ref, package_obj, _) =
+        authority.get_object_read(&package.0).unwrap()
     else {
         panic!("Can't read package")
     };
 
     assert_eq!(package, read_ref);
-    let Data::Package(move_package) = package_obj.data else {
+    let Data::Package(move_package) = package_obj.into_inner().data else {
         panic!("Not a package")
     };
 
@@ -103,16 +104,18 @@ async fn test_publish_empty_package() {
     let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
     let gas = ObjectID::random();
     let authority = init_state_with_ids(vec![(sender, gas)]).await;
+    let rgp = authority.reference_gas_price_for_testing().unwrap();
     let gas_object = authority.get_object(&gas).await.unwrap();
     let gas_object_ref = gas_object.unwrap().compute_object_reference();
 
     // empty package
-    let data = TransactionData::new_module_with_dummy_gas_price(
+    let data = TransactionData::new_module(
         sender,
         gas_object_ref,
         vec![],
         vec![],
-        MAX_GAS,
+        rgp * TEST_ONLY_GAS_UNIT_FOR_PUBLISH,
+        rgp,
     );
     let transaction = to_sender_signed_transaction(data, &sender_key);
     let err = send_and_confirm_transaction(&authority, transaction)
@@ -126,12 +129,13 @@ async fn test_publish_empty_package() {
     );
 
     // empty module
-    let data = TransactionData::new_module_with_dummy_gas_price(
+    let data = TransactionData::new_module(
         sender,
         gas_object_ref,
         vec![vec![]],
         vec![],
-        MAX_GAS,
+        rgp * TEST_ONLY_GAS_UNIT_FOR_PUBLISH,
+        rgp,
     );
     let transaction = to_sender_signed_transaction(data, &sender_key);
     let result = send_and_confirm_transaction(&authority, transaction)
@@ -155,17 +159,19 @@ async fn test_publish_duplicate_modules() {
     let authority = init_state_with_ids(vec![(sender, gas)]).await;
     let gas_object = authority.get_object(&gas).await.unwrap();
     let gas_object_ref = gas_object.unwrap().compute_object_reference();
+    let rgp = authority.reference_gas_price_for_testing().unwrap();
 
     // empty package
     let mut modules = build_test_package("object_owner", /* with_unpublished_deps */ false);
     assert_eq!(modules.len(), 1);
     modules.push(modules[0].clone());
-    let data = TransactionData::new_module_with_dummy_gas_price(
+    let data = TransactionData::new_module(
         sender,
         gas_object_ref,
         modules,
         BuiltInFramework::all_package_ids(),
-        MAX_GAS,
+        rgp * TEST_ONLY_GAS_UNIT_FOR_PUBLISH,
+        rgp,
     );
     let transaction = to_sender_signed_transaction(data, &sender_key);
     let result = send_and_confirm_transaction(&authority, transaction)
@@ -192,7 +198,15 @@ async fn test_generate_lock_file() {
 
     let mut build_config = BuildConfig::new_for_testing();
     build_config.config.lock_file = Some(lock_file_path.clone());
-    sui_framework::build_move_package(&path, build_config).expect("Move package did not build");
+    build_config
+        .clone()
+        .build(&path)
+        .expect("Move package did not build");
+    // Update the lock file with placeholder compiler version so this isn't bumped every release.
+    build_config
+        .config
+        .update_lock_file_toolchain_version(&path, "0.0.1".into())
+        .expect("Could not update lock file");
 
     let mut lock_file_contents = String::new();
     File::open(lock_file_path)
@@ -204,32 +218,38 @@ async fn test_generate_lock_file() {
         # @generated by Move, please check-in and do not edit manually.
 
         [move]
-        version = 0
-
+        version = 3
+        manifest_digest = "4C5606BF71339416027A58BDB5BA2EF2F5E0929FCE98BAB8AFFCBC447AFE3A23"
+        deps_digest = "3C4103934B1E040BB6B23F1D610B4EF9F2F1166A50A104EADCF77467C004C600"
         dependencies = [
-          { name = "Examples" },
-          { name = "Sui" },
+          { id = "Examples", name = "Examples" },
+          { id = "Sui", name = "Sui" },
         ]
 
         [[move.package]]
-        name = "Examples"
+        id = "Examples"
         source = { local = "../object_basics" }
 
         dependencies = [
-          { name = "Sui" },
+          { id = "Sui", name = "Sui" },
         ]
 
         [[move.package]]
-        name = "MoveStdlib"
+        id = "MoveStdlib"
         source = { local = "../../../../../sui-framework/packages/move-stdlib" }
 
         [[move.package]]
-        name = "Sui"
+        id = "Sui"
         source = { local = "../../../../../sui-framework/packages/sui-framework" }
 
         dependencies = [
-          { name = "MoveStdlib" },
+          { id = "MoveStdlib", name = "MoveStdlib" },
         ]
+
+        [move.toolchain-version]
+        compiler-version = "0.0.1"
+        edition = "2024.beta"
+        flavor = "sui"
     "##]];
     expected.assert_eq(lock_file_contents.as_str());
 }
@@ -241,7 +261,9 @@ async fn test_custom_property_parse_published_at() {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.extend(["src", "unit_tests", "data", "custom_properties_in_manifest"]);
 
-    sui_framework::build_move_package(&path, build_config).expect("Move package did not build");
+    build_config
+        .build(&path)
+        .expect("Move package did not build");
     let manifest = manifest_parser::parse_move_manifest_from_file(path.as_path())
         .expect("Could not parse Move.toml");
     let properties = manifest
@@ -276,19 +298,203 @@ async fn test_custom_property_check_unpublished_dependencies() {
 
     let resolution_graph = build_config
         .config
-        .resolution_graph_for_package(&path, &mut std::io::sink())
+        .resolution_graph_for_package(&path, None, &mut std::io::sink())
         .expect("Could not build resolution graph.");
 
-    let SuiError::ModulePublishFailure { error } =
-        check_unpublished_dependencies(&gather_published_ids(&resolution_graph).1.unpublished)
-            .err()
-            .unwrap()
-     else {
+    let SuiError::ModulePublishFailure { error } = check_unpublished_dependencies(
+        &gather_published_ids(&resolution_graph, None).1.unpublished,
+    )
+    .err()
+    .unwrap() else {
         panic!("Expected ModulePublishFailure")
     };
 
     let expected = expect![[r#"
-        Package dependency "CustomPropertiesInManifestDependencyMissingPublishedAt" does not specify a published address (the Move.toml manifest for "CustomPropertiesInManifestDependencyMissingPublishedAt" does not contain a published-at field).
+        Package dependency "CustomPropertiesInManifestDependencyMissingPublishedAt" does not specify a published address (the Move.toml manifest for "CustomPropertiesInManifestDependencyMissingPublishedAt" does not contain a 'published-at' field, nor is there a 'published-id' in the Move.lock).
         If this is intentional, you may use the --with-unpublished-dependencies flag to continue publishing these dependencies as part of your package (they won't be linked against existing packages on-chain)."#]];
     expected.assert_eq(&error)
+}
+
+#[tokio::test]
+#[cfg_attr(msim, ignore)]
+async fn test_publish_extraneous_bytes_modules() {
+    let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
+    let gas = ObjectID::random();
+    let authority = init_state_with_ids(vec![(sender, gas)]).await;
+    let gas_object = authority.get_object(&gas).await.unwrap();
+    let gas_object_ref = gas_object.unwrap().compute_object_reference();
+    let rgp = authority.reference_gas_price_for_testing().unwrap();
+
+    // test valid module bytes
+    let correct_modules =
+        build_test_package("object_owner", /* with_unpublished_deps */ false);
+    assert_eq!(correct_modules.len(), 1);
+    let data = TransactionData::new_module(
+        sender,
+        gas_object_ref,
+        correct_modules.clone(),
+        BuiltInFramework::all_package_ids(),
+        rgp * TEST_ONLY_GAS_UNIT_FOR_PUBLISH,
+        rgp,
+    );
+    let transaction = to_sender_signed_transaction(data, &sender_key);
+    let result = send_and_confirm_transaction(&authority, transaction)
+        .await
+        .unwrap()
+        .1;
+    assert_eq!(result.status(), &ExecutionStatus::Success);
+
+    // make the bytes invalid
+    let gas_object = authority.get_object(&gas).await.unwrap();
+    let gas_object_ref = gas_object.unwrap().compute_object_reference();
+    let mut modules = correct_modules.clone();
+    modules[0].push(0);
+    assert_eq!(modules.len(), 1);
+    let data = TransactionData::new_module(
+        sender,
+        gas_object_ref,
+        modules,
+        BuiltInFramework::all_package_ids(),
+        rgp * TEST_ONLY_GAS_UNIT_FOR_PUBLISH,
+        rgp,
+    );
+    let transaction = to_sender_signed_transaction(data, &sender_key);
+    let result = send_and_confirm_transaction(&authority, transaction)
+        .await
+        .unwrap()
+        .1;
+    assert_eq!(
+        result.status(),
+        &ExecutionStatus::Failure {
+            error: ExecutionFailureStatus::VMVerificationOrDeserializationError,
+            command: Some(0)
+        }
+    );
+
+    // make the bytes invalid, in a different way
+    let gas_object = authority.get_object(&gas).await.unwrap();
+    let gas_object_ref = gas_object.unwrap().compute_object_reference();
+    let mut modules = correct_modules.clone();
+    let first_module = modules[0].clone();
+    modules[0].extend(first_module);
+    assert_eq!(modules.len(), 1);
+    let data = TransactionData::new_module(
+        sender,
+        gas_object_ref,
+        modules,
+        BuiltInFramework::all_package_ids(),
+        rgp * TEST_ONLY_GAS_UNIT_FOR_PUBLISH,
+        rgp,
+    );
+    let transaction = to_sender_signed_transaction(data, &sender_key);
+    let result = send_and_confirm_transaction(&authority, transaction)
+        .await
+        .unwrap()
+        .1;
+    assert_eq!(
+        result.status(),
+        &ExecutionStatus::Failure {
+            error: ExecutionFailureStatus::VMVerificationOrDeserializationError,
+            command: Some(0)
+        }
+    );
+
+    // make the bytes invalid by adding metadata
+    let gas_object = authority.get_object(&gas).await.unwrap();
+    let gas_object_ref = gas_object.unwrap().compute_object_reference();
+    let mut modules = correct_modules.clone();
+    let new_bytes = {
+        let mut m = CompiledModule::deserialize_with_defaults(&modules[0]).unwrap();
+        m.metadata.push(move_core_types::metadata::Metadata {
+            key: vec![0],
+            value: vec![1],
+        });
+        let mut buf = vec![];
+        m.serialize_with_version(m.version, &mut buf).unwrap();
+        buf
+    };
+    modules[0] = new_bytes;
+    assert_eq!(modules.len(), 1);
+    let data = TransactionData::new_module(
+        sender,
+        gas_object_ref,
+        modules,
+        BuiltInFramework::all_package_ids(),
+        rgp * TEST_ONLY_GAS_UNIT_FOR_PUBLISH,
+        rgp,
+    );
+    let transaction = to_sender_signed_transaction(data, &sender_key);
+    let result = send_and_confirm_transaction(&authority, transaction)
+        .await
+        .unwrap()
+        .1;
+    assert_eq!(
+        result.status(),
+        &ExecutionStatus::Failure {
+            error: ExecutionFailureStatus::VMVerificationOrDeserializationError,
+            command: Some(0)
+        }
+    )
+}
+
+#[tokio::test]
+#[cfg_attr(msim, ignore)]
+async fn test_publish_max_packages() {
+    let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
+    let gas_object_id = ObjectID::random();
+    let authority = init_state_with_ids(vec![(sender, gas_object_id)]).await;
+
+    let (_, modules, dependencies) = build_package("object_basics", false);
+
+    // push max number of packages allowed to publish
+    let max_pub_cmd = authority
+        .epoch_store_for_testing()
+        .protocol_config()
+        .max_publish_or_upgrade_per_ptb_as_option()
+        .unwrap_or(0);
+    assert!(max_pub_cmd > 0);
+    let packages = vec![(modules, dependencies); max_pub_cmd as usize];
+
+    let mut builder = ProgrammableTransactionBuilder::new();
+    build_multi_publish_txns(&mut builder, sender, packages);
+    let result = run_multi_txns(&authority, sender, &sender_key, &gas_object_id, builder)
+        .await
+        .unwrap()
+        .1;
+    let effects = result.into_data();
+    assert_eq!(effects.status(), &ExecutionStatus::Success);
+}
+
+#[tokio::test]
+#[cfg_attr(msim, ignore)]
+async fn test_publish_more_than_max_packages_error() {
+    let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
+    let gas_object_id = ObjectID::random();
+    let authority = init_state_with_ids(vec![(sender, gas_object_id)]).await;
+
+    let (_, modules, dependencies) = build_package("object_basics", false);
+
+    // push max number of packages allowed to publish
+    let max_pub_cmd = authority
+        .epoch_store_for_testing()
+        .protocol_config()
+        .max_publish_or_upgrade_per_ptb_as_option()
+        .unwrap_or(0);
+    assert!(max_pub_cmd > 0);
+    let packages = vec![(modules, dependencies); (max_pub_cmd + 1) as usize];
+
+    let mut builder = ProgrammableTransactionBuilder::new();
+    build_multi_publish_txns(&mut builder, sender, packages);
+    let err = run_multi_txns(&authority, sender, &sender_key, &gas_object_id, builder)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        SuiError::UserInputError {
+            error: UserInputError::MaxPublishCountExceeded {
+                max_publish_commands: max_pub_cmd,
+                publish_count: max_pub_cmd + 1,
+            }
+        }
+    );
 }

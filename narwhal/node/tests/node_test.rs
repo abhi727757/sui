@@ -10,10 +10,9 @@ use narwhal_node::worker_node::WorkerNodes;
 use network::client::NetworkClient;
 use prometheus::Registry;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::time::Duration;
 use storage::NodeStorage;
-use test_utils::{temp_dir, CommitteeFixture};
+use test_utils::{latest_protocol_version, temp_dir, CommitteeFixture};
 use tokio::sync::mpsc::channel;
 use tokio::time::sleep;
 use worker::TrivialTransactionValidator;
@@ -40,15 +39,16 @@ async fn simple_primary_worker_node_start_stop() {
     let store = NodeStorage::reopen(temp_dir(), None);
 
     let (tx_confirmation, _rx_confirmation) = channel(10);
-    let execution_state = Arc::new(SimpleExecutionState::new(tx_confirmation));
+    let execution_state = SimpleExecutionState::new(tx_confirmation);
 
     // WHEN
-    let primary_node = PrimaryNode::new(parameters.clone(), true, registry_service.clone());
+    let primary_node = PrimaryNode::new(parameters.clone(), registry_service.clone());
     primary_node
         .start(
             key_pair.copy(),
             network_key_pair.copy(),
             committee.clone(),
+            latest_protocol_version(),
             worker_cache.clone(),
             client.clone(),
             &store,
@@ -65,10 +65,11 @@ async fn simple_primary_worker_node_start_stop() {
             key_pair.public().clone(),
             vec![(0, authority.worker(0).keypair().copy())],
             committee,
+            latest_protocol_version(),
             worker_cache,
             client,
             &store,
-            TrivialTransactionValidator::default(),
+            TrivialTransactionValidator,
         )
         .await
         .unwrap();
@@ -122,19 +123,20 @@ async fn primary_node_restart() {
     let store = NodeStorage::reopen(temp_dir(), None);
 
     let (tx_confirmation, _rx_confirmation) = channel(10);
-    let execution_state = Arc::new(SimpleExecutionState::new(tx_confirmation));
+    let execution_state = SimpleExecutionState::new(tx_confirmation.clone());
 
     // AND
-    let primary_node = PrimaryNode::new(parameters.clone(), true, registry_service.clone());
+    let primary_node = PrimaryNode::new(parameters.clone(), registry_service.clone());
     primary_node
         .start(
             key_pair.copy(),
             network_key_pair.copy(),
             committee.clone(),
+            latest_protocol_version(),
             worker_cache.clone(),
             client.clone(),
             &store,
-            execution_state.clone(),
+            execution_state,
         )
         .await
         .unwrap();
@@ -147,11 +149,13 @@ async fn primary_node_restart() {
     primary_node.shutdown().await;
 
     // AND start again the node
+    let execution_state = SimpleExecutionState::new(tx_confirmation.clone());
     primary_node
         .start(
             key_pair.copy(),
             network_key_pair.copy(),
             committee.clone(),
+            latest_protocol_version(),
             worker_cache.clone(),
             client.clone(),
             &store,

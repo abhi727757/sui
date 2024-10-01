@@ -26,7 +26,8 @@ use crate::load_test::LoadTestConfig;
 use sui_sdk::{SuiClient, SuiClientBuilder};
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
 use sui_types::crypto::{get_key_pair, AccountKeyPair, EncodeDecodeBase64, Signature, SuiKeyPair};
-use sui_types::messages::{ExecuteTransactionRequestType, Transaction, TransactionData};
+use sui_types::quorum_driver_types::ExecuteTransactionRequestType;
+use sui_types::transaction::{Transaction, TransactionData};
 
 use crate::payload::checkpoint_utils::get_latest_checkpoint_stats;
 use crate::payload::validation::chunk_entities;
@@ -359,7 +360,7 @@ fn write_data_to_file<T: Serialize>(data: &T, file_path: &str) -> Result<(), any
     fs::create_dir_all(&path_buf).map_err(|e| anyhow!("Error creating directory: {}", e))?;
 
     let file_name = format!("{}.json", file_path);
-    let file = File::create(&file_name).map_err(|e| anyhow!("Error creating file: {}", e))?;
+    let file = File::create(file_name).map_err(|e| anyhow!("Error creating file: {}", e))?;
     serde_json::to_writer(file, data).map_err(|e| anyhow!("Error writing to file: {}", e))?;
 
     Ok(())
@@ -636,7 +637,7 @@ async fn prepare_new_signer_and_coins(
                 .extend(split_coins(client, &burner_keypair, coin_id, gas_coin_id, splits).await);
         }
     }
-    assert_eq!(results.len(), num_coins as usize);
+    assert_eq!(results.len(), num_coins);
     debug!("Split off {} coins for gas payment {results:?}", num_coins);
     (results, burner_keypair.encode_base64())
 }
@@ -648,7 +649,7 @@ fn num_transactions_needed(num_coins: usize, new_coins_per_txn: usize) -> usize 
     if num_coins == 1 {
         return 0;
     }
-    ((num_coins + new_coins_per_txn - 1) / new_coins_per_txn) as usize
+    (num_coins + new_coins_per_txn - 1) / new_coins_per_txn
 }
 
 /// Calculate the split amounts for a given number of coins, amount per coin, and maximum number of coins per transaction.
@@ -775,11 +776,9 @@ pub(crate) async fn sign_and_execute(
     );
 
     let transaction_response = match client
-        .quorum_driver()
+        .quorum_driver_api()
         .execute_transaction_block(
-            Transaction::from_data(txn_data, Intent::sui_transaction(), vec![signature])
-                .verify()
-                .expect("signature error"),
+            Transaction::from_data(txn_data, vec![signature]),
             SuiTransactionBlockResponseOptions::new().with_effects(),
             Some(request_type),
         )

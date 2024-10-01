@@ -8,11 +8,15 @@ use move_command_line_common::{
     types::{ParsedType, TypeToken},
 };
 use move_core_types::{account_address::AccountAddress, identifier::Identifier};
-use sui_types::messages::{Argument, Command, ProgrammableMoveCall};
+use sui_types::{
+    base_types::ObjectID,
+    transaction::{Argument, Command, ProgrammableMoveCall},
+    type_input::TypeInput,
+};
 
 use crate::programmable_transaction_test_parser::token::{
-    GAS_COIN, INPUT, MAKE_MOVE_VEC, MERGE_COINS, NESTED_RESULT, RESULT, SPLIT_COINS,
-    TRANSFER_OBJECTS,
+    GAS_COIN, INPUT, MAKE_MOVE_VEC, MERGE_COINS, NESTED_RESULT, PUBLISH, RESULT, SPLIT_COINS,
+    TRANSFER_OBJECTS, UPGRADE,
 };
 
 use super::token::CommandToken;
@@ -45,6 +49,8 @@ pub enum ParsedCommand {
     SplitCoins(Argument, Vec<Argument>),
     MergeCoins(Argument, Vec<Argument>),
     MakeMoveVec(Option<ParsedType>, Vec<Argument>),
+    Publish(String, Vec<String>),
+    Upgrade(String, Vec<String>, String, Argument),
 }
 
 impl<'a, I: Iterator<Item = (CommandToken, &'a str)>>
@@ -144,6 +150,47 @@ where
                 self.maybe_trailing_comma()?;
                 self.inner().advance(Tok::RParen)?;
                 ParsedCommand::MakeMoveVec(type_opt, args)
+            }
+            (Tok::Ident, PUBLISH) => {
+                self.inner().advance(Tok::LParen)?;
+                let staged_package = self.inner().advance(Tok::Ident)?;
+                self.inner().advance(Tok::Comma)?;
+                self.inner().advance(Tok::LBracket)?;
+                let dependencies = self.inner().parse_list(
+                    |p| Ok(p.advance(Tok::Ident)?.to_owned()),
+                    CommandToken::Comma,
+                    Tok::RBracket,
+                    /* allow_trailing_delim */ true,
+                )?;
+                self.inner().advance(Tok::RBracket)?;
+                self.maybe_trailing_comma()?;
+                self.inner().advance(Tok::RParen)?;
+                ParsedCommand::Publish(staged_package.to_owned(), dependencies)
+            }
+            (Tok::Ident, UPGRADE) => {
+                self.inner().advance(Tok::LParen)?;
+                let staged_package = self.inner().advance(Tok::Ident)?;
+                self.inner().advance(Tok::Comma)?;
+                self.inner().advance(Tok::LBracket)?;
+                let dependencies = self.inner().parse_list(
+                    |p| Ok(p.advance(Tok::Ident)?.to_owned()),
+                    CommandToken::Comma,
+                    Tok::RBracket,
+                    /* allow_trailing_delim */ true,
+                )?;
+                self.inner().advance(Tok::RBracket)?;
+                self.inner().advance(Tok::Comma)?;
+                let upgraded_package = self.inner().advance(Tok::Ident)?;
+                self.inner().advance(Tok::Comma)?;
+                let upgrade_ticket = self.parse_command_arg()?;
+                self.maybe_trailing_comma()?;
+                self.inner().advance(Tok::RParen)?;
+                ParsedCommand::Upgrade(
+                    staged_package.to_owned(),
+                    dependencies,
+                    upgraded_package.to_owned(),
+                    upgrade_ticket,
+                )
             }
             (Tok::Ident, contents) => {
                 let package = Identifier::new(contents)?;
@@ -277,6 +324,7 @@ impl ParsedCommand {
 
     pub fn into_command(
         self,
+        staged_packages: &impl Fn(&str) -> Option<Vec<Vec<u8>>>,
         address_mapping: &impl Fn(&str) -> Option<AccountAddress>,
     ) -> Result<Command> {
         Ok(match self {
@@ -288,12 +336,42 @@ impl ParsedCommand {
             }
             ParsedCommand::SplitCoins(coin, amts) => Command::SplitCoins(coin, amts),
             ParsedCommand::MergeCoins(target, coins) => Command::MergeCoins(target, coins),
-            ParsedCommand::MakeMoveVec(ty_opt, args) => Command::MakeMoveVec(
+            ParsedCommand::MakeMoveVec(ty_opt, args) => Command::make_move_vec(
                 ty_opt
                     .map(|t| t.into_type_tag(address_mapping))
                     .transpose()?,
                 args,
             ),
+            ParsedCommand::Publish(staged_package, dependencies) => {
+                let Some(package_contents) = staged_packages(&staged_package) else {
+                    bail!("No staged package '{staged_package}'");
+                };
+                let dependencies = dependencies
+                    .into_iter()
+                    .map(|d| match address_mapping(&d) {
+                        Some(a) => Ok(a.into()),
+                        None => bail!("Unbound dependency '{d}"),
+                    })
+                    .collect::<Result<Vec<ObjectID>>>()?;
+                Command::Publish(package_contents, dependencies)
+            }
+            ParsedCommand::Upgrade(staged_package, dependencies, upgraded_package, ticket) => {
+                let Some(package_contents) = staged_packages(&staged_package) else {
+                    bail!("No staged package '{staged_package}'");
+                };
+                let dependencies = dependencies
+                    .into_iter()
+                    .map(|d| match address_mapping(&d) {
+                        Some(a) => Ok(a.into()),
+                        None => bail!("Unbound dependency '{d}"),
+                    })
+                    .collect::<Result<Vec<ObjectID>>>()?;
+                let Some(upgraded_package) = address_mapping(&upgraded_package) else {
+                    bail!("Unbound upgraded package '{upgraded_package}'");
+                };
+                let upgraded_package = upgraded_package.into();
+                Command::Upgrade(package_contents, dependencies, upgraded_package, ticket)
+            }
         })
     }
 }
@@ -315,12 +393,12 @@ impl ParsedMoveCall {
         };
         let type_arguments = type_arguments
             .into_iter()
-            .map(|t| t.into_type_tag(address_mapping))
+            .map(|t| t.into_type_tag(address_mapping).map(TypeInput::from))
             .collect::<Result<_>>()?;
         Ok(ProgrammableMoveCall {
             package: package.into(),
-            module,
-            function,
+            module: module.to_string(),
+            function: function.to_string(),
             type_arguments,
             arguments,
         })

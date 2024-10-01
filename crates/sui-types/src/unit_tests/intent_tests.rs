@@ -5,12 +5,13 @@ use fastcrypto::traits::KeyPair;
 
 use crate::{
     base_types::{dbg_addr, ObjectID},
+    committee::EpochId,
     crypto::{
-        AccountKeyPair, AuthorityKeyPair, AuthoritySignature, Signature, SuiAuthoritySignature,
-        SuiSignature,
+        AccountKeyPair, AuthorityKeyPair, AuthoritySignature, Signature, SignatureScheme,
+        SuiAuthoritySignature, SuiSignature,
     },
-    messages::{Transaction, TransactionData},
     object::Object,
+    transaction::{Transaction, TransactionData, TEST_ONLY_GAS_UNIT_FOR_TRANSFER},
 };
 
 use crate::crypto::get_key_pair;
@@ -48,12 +49,17 @@ fn test_personal_message_intent() {
 
     // Let's ensure we can sign and verify intents.
     let s = Signature::new_secure(&IntentMessage::new(intent1, p_message), &sec1);
-    let verification = s.verify_secure(&IntentMessage::new(intent2, p_message_2), addr1);
+    let verification = s.verify_secure(
+        &IntentMessage::new(intent2, p_message_2),
+        addr1,
+        SignatureScheme::ED25519,
+    );
     assert!(verification.is_ok())
 }
 
 #[test]
 fn test_authority_signature_intent() {
+    let epoch: EpochId = 0;
     let kp: AuthorityKeyPair = get_key_pair().1;
 
     // Create a signed user transaction.
@@ -61,20 +67,24 @@ fn test_authority_signature_intent() {
     let recipient = dbg_addr(2);
     let object_id = ObjectID::random();
     let object = Object::immutable_with_id_for_testing(object_id);
-    let data = TransactionData::new_transfer_sui_with_dummy_gas_price(
+    let gas_price = 1000;
+    let data = TransactionData::new_transfer_sui(
         recipient,
         sender,
         None,
         object.compute_object_reference(),
-        10000,
+        gas_price * TEST_ONLY_GAS_UNIT_FOR_TRANSFER,
+        gas_price,
     );
     let signature = Signature::new_secure(
         &IntentMessage::new(Intent::sui_transaction(), data.clone()),
         &sender_key,
     );
-    let tx = Transaction::from_data(data, Intent::sui_transaction(), vec![signature]);
+    let tx = Transaction::from_data(data, vec![signature]);
     let tx1 = tx.clone();
-    assert!(tx.verify().is_ok());
+    assert!(tx
+        .try_into_verified_for_testing(epoch, &Default::default())
+        .is_ok());
 
     // Create an intent with signed data.
     let intent_bcs = bcs::to_bytes(tx1.intent_message()).unwrap();
@@ -94,7 +104,7 @@ fn test_authority_signature_intent() {
     assert_eq!(&intent_bcs[3..], signed_data_bcs);
 
     // Let's ensure we can sign and verify intents.
-    let s = AuthoritySignature::new_secure(tx1.data().intent_message(), &0, &kp);
+    let s = AuthoritySignature::new_secure(tx1.data().intent_message(), &epoch, &kp);
     let verification = s.verify_secure(tx1.data().intent_message(), 0, kp.public().into());
     assert!(verification.is_ok())
 }

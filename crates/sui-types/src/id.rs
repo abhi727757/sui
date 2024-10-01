@@ -3,12 +3,13 @@
 
 use crate::MoveTypeTagTrait;
 use crate::{base_types::ObjectID, SUI_FRAMEWORK_ADDRESS};
+use move_core_types::account_address::AccountAddress;
 use move_core_types::language_storage::TypeTag;
 use move_core_types::{
+    annotated_value::{MoveFieldLayout, MoveStructLayout, MoveTypeLayout},
     ident_str,
     identifier::IdentStr,
     language_storage::StructTag,
-    value::{MoveFieldLayout, MoveStructLayout, MoveTypeLayout},
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,8 @@ pub const OBJECT_MODULE_NAME_STR: &str = "object";
 pub const OBJECT_MODULE_NAME: &IdentStr = ident_str!(OBJECT_MODULE_NAME_STR);
 pub const UID_STRUCT_NAME: &IdentStr = ident_str!("UID");
 pub const ID_STRUCT_NAME: &IdentStr = ident_str!("ID");
+pub const RESOLVED_SUI_ID: (&AccountAddress, &IdentStr, &IdentStr) =
+    (&SUI_FRAMEWORK_ADDRESS, OBJECT_MODULE_NAME, ID_STRUCT_NAME);
 
 /// Rust version of the Move sui::object::Info type
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone, Eq, PartialEq)]
@@ -56,12 +59,12 @@ impl UID {
     }
 
     pub fn layout() -> MoveStructLayout {
-        MoveStructLayout::WithTypes {
+        MoveStructLayout {
             type_: Self::type_(),
-            fields: vec![MoveFieldLayout::new(
+            fields: Box::new(vec![MoveFieldLayout::new(
                 ident_str!("id").to_owned(),
-                MoveTypeLayout::Struct(ID::layout()),
-            )],
+                MoveTypeLayout::Struct(Box::new(ID::layout())),
+            )]),
         }
     }
 }
@@ -81,12 +84,12 @@ impl ID {
     }
 
     pub fn layout() -> MoveStructLayout {
-        MoveStructLayout::WithTypes {
+        MoveStructLayout {
             type_: Self::type_(),
-            fields: vec![MoveFieldLayout::new(
+            fields: Box::new(vec![MoveFieldLayout::new(
                 ident_str!("bytes").to_owned(),
                 MoveTypeLayout::Address,
-            )],
+            )]),
         }
     }
 }

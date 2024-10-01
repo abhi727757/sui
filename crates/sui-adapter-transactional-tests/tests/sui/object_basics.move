@@ -9,21 +9,18 @@
 
 module test::object_basics {
     use sui::event;
-    use sui::object::{Self, UID};
-    use sui::tx_context::{Self, TxContext};
-    use sui::transfer;
 
-    struct Object has key, store {
+    public struct Object has key, store {
         id: UID,
         value: u64,
     }
 
-    struct Wrapper has key {
+    public struct Wrapper has key {
         id: UID,
         o: Object
     }
 
-    struct NewValueEvent has copy, drop {
+    public struct NewValueEvent has copy, drop {
         new_value: u64
     }
 
@@ -34,7 +31,7 @@ module test::object_basics {
         )
     }
 
-    public entry fun transfer(o: Object, recipient: address) {
+    public entry fun transfer_(o: Object, recipient: address) {
         transfer::public_transfer(o, recipient)
     }
 
@@ -73,12 +70,12 @@ module test::object_basics {
 
 //# view-object 2,0
 
-//# run test::object_basics::transfer --sender A --args object(2,0) @B
+//# run test::object_basics::transfer_ --sender A --args object(2,0) @B
 
 //# view-object 2,0
 
 //# run test::object_basics::create --sender B --args 20 @B
 
-//# run test::object_basics::update --sender B --args object(2,0) object(6,0) --view-events
+//# run test::object_basics::update --sender B --args object(2,0) object(6,0)
 
 //# run test::object_basics::delete --sender B --args object(2,0)
